@@ -15,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.market import Candle, MarketAggregator, normalize_symbol  # noqa: E402
-from core.wallet import DCAPlan, PriceAlert, ShortPosition, Trade, Wallet, WalletStore, now  # noqa: E402
+from core.wallet import DCAPlan, FuturesPosition, PriceAlert, Trade, Wallet, WalletStore, now  # noqa: E402
 from core.chart import curve_html, kline_html, kline_text, sparkline  # noqa: E402
 
 PASS, FAIL = 0, 0
@@ -66,16 +66,17 @@ try:
 except ValueError:
     check("超额买入拦截", True)
 
-# ─── 钱包：空单与爆仓 ───
+# ─── 钱包：合约仓位（空/多）与爆仓 ───
 print("[杠杆做空]")
 w3 = Wallet("t3", 10000.0)
 # 1 手 100 U/个，10x：名义 100，保证金 10
 w3.open_short("BTC", 1.0, 10.0, 100.0, 0.0, 0.005)
-sp = w3.shorts["BTC"]
+sp = w3.shorts["BTC|S"]
 check("保证金占用", approx(sp.margin, 10.0))
 check("爆仓价 = entry*(1+1/lev-mmr)", approx(sp.liquidation_price, 100 * (1 + 0.1 - 0.005)))
 check("浮盈（跌到90）", approx(sp.unrealized(90.0), 10.0))
 check("浮亏（涨到105）", approx(sp.unrealized(105.0), -5.0))
+check("空单标记价", sp.side == "short")
 
 tc = w3.close_short("BTC", None, 90.0, 0.0)   # 平空赚10
 check("平空盈亏", approx(tc.pnl, 10.0))
@@ -87,7 +88,7 @@ cash_before = w3.cash
 hit = w3.check_liquidation({"ETH": 150.0})
 check("爆仓触发", len(hit) == 1)
 check("爆仓损失=保证金", approx(w3.realized_pnl, 10.0 - 50.0))  # 前赚10 - 爆仓50
-check("空单移除", "ETH" not in w3.shorts)
+check("空单移除", "ETH|S" not in w3.shorts)
 hit2 = w3.check_liquidation({"ETH": 999.0})
 check("不重复爆仓", len(hit2) == 0)
 
@@ -95,8 +96,36 @@ check("不重复爆仓", len(hit2) == 0)
 w4 = Wallet("t4", 10000.0)
 w4.open_short("SOL", 10.0, 5.0, 10.0, 0.0, 0.005)
 w4.close_short("SOL", 5.0, 8.0, 0.0)
-check("部分平空后余量", approx(w4.shorts["SOL"].qty, 5.0))
+check("部分平空后余量", approx(w4.shorts["SOL|S"].qty, 5.0))
 check("部分平空盈亏", approx(w4.realized_pnl, (10 - 8) * 5))
+
+# ─── 杠杆做多 ───
+print("[杠杆做多]")
+wL = Wallet("tL", 10000.0)
+# 2 个 @100，5x：名义 200，保证金 40，爆仓价 100*(1-0.2+0.005)=80.5
+wL.open_long("BTC", 2.0, 5.0, 100.0, 0.0, 0.005)
+lp = wL.shorts["BTC|L"]
+check("多单保证金", approx(lp.margin, 40.0))
+check("多单爆仓价 = entry*(1-1/lev+mmr)", approx(lp.liquidation_price, 80.5))
+check("多单浮盈（涨到110）", approx(lp.unrealized(110.0), 20.0))
+check("多单浮亏（跌到95）", approx(lp.unrealized(95.0), -10.0))
+check("多空可并存", (wL.open_short("BTC", 1.0, 2.0, 100.0, 0.0, 0.005), "BTC|L" in wL.shorts and "BTC|S" in wL.shorts)[1])
+tl = wL.close_long("BTC", None, 110.0, 0.0)
+check("平多盈亏", approx(tl.pnl, 20.0))
+# 开多占40 + 开空占50 → cash 9910；平多返 40+20 → 9970
+check("平多后保证金返还", approx(wL.cash, 9970.0))
+# 多单爆仓：1 个 @100 2x，爆仓价 100*(0.5+0.005)=50.5
+wL.open_long("ETH", 1.0, 2.0, 100.0, 0.0, 0.005)
+hitL = wL.check_liquidation({"ETH": 50.0})
+check("多单爆仓触发", len(hitL) == 1 and hitL[0][0].side == "long")
+check("多单爆仓损失=保证金", approx(wL.realized_pnl, 20.0 - 50.0))
+# 同币重复开多拦截
+wL.open_long("SOL", 1.0, 1.0, 50.0, 0.0, 0.005)
+try:
+    wL.open_long("SOL", 1.0, 1.0, 50.0, 0.0, 0.005)
+    check("重复开多拦截", False)
+except ValueError:
+    check("重复开多拦截", True)
 
 # ─── 定投 ───
 print("[定投]")
@@ -119,7 +148,7 @@ d = w5.to_dict()
 w5r = Wallet.from_dict(json.loads(json.dumps(d)))
 check("现金 round-trip", approx(w5r.cash, w5.cash))
 check("持仓 round-trip", approx(w5r.positions["BTC"]["qty"], w5.positions["BTC"]["qty"]))
-check("空单 round-trip", approx(w5r.shorts["DOGE"].margin, w5.shorts["DOGE"].margin))
+check("合约 round-trip", approx(w5r.shorts["DOGE|S"].margin, w5.shorts["DOGE|S"].margin))
 check("定投 round-trip", w5r.plans[plan.id].symbol == "BTC")
 check("快照 round-trip", len(w5r.snapshots) == len(w5.snapshots))
 check("成交 round-trip", len(w5r.trades) == len(w5.trades))
@@ -175,14 +204,25 @@ check("止损盈亏为负", approx(w7.realized_pnl, (44 - 50) * 40))
 
 w8 = Wallet("t8", 10000.0)
 w8.open_short("SOL", 100, 5.0, 20.0, 0.0, 0.005)    # 空 100 @20
-w8.shorts["SOL"].tp_price = 18.0
-w8.shorts["SOL"].sl_price = 22.0
+w8.shorts["SOL|S"].tp_price = 18.0
+w8.shorts["SOL|S"].sl_price = 22.0
 ev = w8.check_tp_sl({"SOL": 19.0})
 check("空单未到价不触发", ev == [])
 ev = w8.check_tp_sl({"SOL": 17.5})
 check("空单止盈触发（跌）", len(ev) == 1 and "止盈" in ev[0])
-check("空单止盈后移除", "SOL" not in w8.shorts)
+check("空单止盈后移除", "SOL|S" not in w8.shorts)
 check("空单止盈盈亏", approx(w8.realized_pnl, (20 - 17.5) * 100))
+
+# 多单止盈止损（方向与空单相反）
+w8b = Wallet("t8b", 10000.0)
+w8b.open_long("SOL", 100, 5.0, 20.0, 0.0, 0.005)    # 多 100 @20
+w8b.shorts["SOL|L"].tp_price = 22.0
+w8b.shorts["SOL|L"].sl_price = 18.0
+ev = w8b.check_tp_sl({"SOL": 21.0})
+check("多单未到价不触发", ev == [])
+ev = w8b.check_tp_sl({"SOL": 22.5})
+check("多单止盈触发（涨）", len(ev) == 1 and "止盈" in ev[0])
+check("多单止盈盈亏", approx(w8b.realized_pnl, (22.5 - 20.0) * 100))
 
 # set_tp_sl API
 w9 = Wallet("t9", 10000.0)
@@ -200,6 +240,32 @@ check("auto 落到空单", w9.set_tp_sl("ETH", tp=1.0) == "short")
 w9.buy("ETH", 500, 100.0, 0.0)  # 现在现货+空单并存
 check("同时持有返回歧义", w9.set_tp_sl("ETH", tp=1.0) == "AMBIVALENT")
 check("明确 side=short", w9.set_tp_sl("ETH", sl=150.0, side="short") == "short")
+check("明确 side=spot", w9.set_tp_sl("ETH", sl=80.0, side="spot") == "spot")
+
+# ─── 资金费结算 ───
+print("[资金费]")
+wF = Wallet("tF", 10000.0)
+wF.open_long("BTC", 1.0, 2.0, 100.0, 0.0, 0.005)    # 多 1 @100，名义 100
+wF.open_short("ETH", 2.0, 2.0, 50.0, 0.0, 0.005)     # 空 2 @50，名义 100
+cash0 = wF.cash
+ev = wF.settle_funding({"BTC": 0.0001, "ETH": 0.0001})  # 正费率：多付 0.01，空收 0.01
+check("正费率：多付空收", approx(wF.cash, cash0 - 0.01 + 0.01))
+check("多单累计付费", approx(wF.shorts["BTC|L"].funding_paid, 0.01))
+check("空单累计收费", approx(wF.shorts["ETH|S"].funding_paid, -0.01))
+check("结算事件2条", len(ev) == 2)
+ev = wF.settle_funding({"BTC": -0.0002})              # 负费率：多收 0.02
+check("负费率：多单收取", approx(wF.cash, cash0 + 0.02))
+check("缺费率币种跳过", wF.settle_funding({}) == [])
+# 异常费率截断（±5%）
+wF.settle_funding({"BTC": 0.5})
+check("异常费率截断", approx(wF.shorts["BTC|L"].funding_paid, 0.01 - 0.02 + 100 * 0.05))
+# 资金费计入平仓结算：平空返还算清
+wF2 = Wallet("tF2", 10000.0)
+wF2.open_short("BTC", 1.0, 2.0, 100.0, 0.0, 0.005)   # 保证金 50
+wF2.settle_funding({"BTC": 0.001})                    # 空收 0.1
+c_before = wF2.cash                                   # 9950 + 0.1
+tF2 = wF2.close_short("BTC", None, 100.0, 0.0)        # 平仓不赚不亏
+check("平仓时资金费不重复扣", approx(wF2.cash, c_before + 50.0))
 
 # ─── 价格警报 ───
 print("[价格警报]")
@@ -213,19 +279,20 @@ w10 = Wallet("t10", 5000.0)
 w10.buy("BTC", 1000, 100.0, 0.0)
 w10.positions["BTC"]["tp_price"] = 130.0
 w10.open_short("DOGE", 1000, 3.0, 0.5, 0.0, 0.005)
-w10.shorts["DOGE"].sl_price = 0.55
+w10.shorts["DOGE|S"].sl_price = 0.55
 al = PriceAlert(symbol="SOL", op="<=", price=100, stream_id="sx")
 w10.alerts[al.id] = al
 d10 = json.loads(json.dumps(w10.to_dict()))
 w10r = Wallet.from_dict(d10)
 check("tp/sl round-trip（现货）", approx(w10r.positions["BTC"]["tp_price"], 130.0))
-check("tp/sl round-trip（空单）", approx(w10r.shorts["DOGE"].sl_price, 0.55))
+check("tp/sl round-trip（空单）", approx(w10r.shorts["DOGE|S"].sl_price, 0.55))
 check("alerts round-trip", len(w10r.alerts) == 1 and list(w10r.alerts.values())[0].op == "<=")
 # 旧格式（无 tp/sl/alerts 字段）向后兼容
 old = {"key": "old", "initial_cash": 100, "cash": 100, "positions": {"BTC": {"qty": 1, "avg_cost": 100}},
        "shorts": {"ETH": {"symbol": "ETH", "qty": 1, "entry_price": 100, "leverage": 2, "margin": 50, "liquidation_price": 149.5}}}
 wold = Wallet.from_dict(old)
-check("旧钱包兼容（tp/sl 默认0）", wold.positions["BTC"].get("tp_price", 0) == 0 and wold.shorts["ETH"].tp_price == 0)
+check("旧钱包兼容（key 迁移 ETH|S）", "ETH|S" in wold.shorts and wold.shorts["ETH|S"].side == "short")
+check("旧钱包兼容（tp/sl 默认0）", wold.positions["BTC"].get("tp_price", 0) == 0 and wold.shorts["ETH|S"].tp_price == 0)
 check("旧钱包兼容（alerts 空）", wold.alerts == {})
 
 # ─── 图表 ───

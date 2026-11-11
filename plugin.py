@@ -30,10 +30,17 @@ from typing import List  # noqa: E402
 
 from core.chart import curve_html, kline_html, kline_text, sparkline  # noqa: E402
 from core.market import MarketAggregator, Ticker24h, normalize_symbol  # noqa: E402
-from core.wallet import DCAPlan, PriceAlert, ShortPosition, Trade, Wallet, WalletStore, now  # noqa: E402
+from core.wallet import DCAPlan, FuturesPosition, PriceAlert, Trade, Wallet, WalletStore, now  # noqa: E402
 
-PLUGIN_VERSION = "0.2.0"
+PLUGIN_VERSION = "0.3.0"
 KLINE_INTERVALS = ("5m", "15m", "1h", "4h", "1d")
+FUNDING_INTERVAL = 8 * 3600  # 资金费结算周期：8 小时（UTC 0/8/16 点对齐）
+
+
+def next_funding_ts(t: int) -> int:
+    """下一个资金费结算时间戳（UTC 0/8/16 点对齐）。"""
+    slot = t // FUNDING_INTERVAL
+    return (slot + 1) * FUNDING_INTERVAL
 
 
 # ─────────────────────────── 配置 ───────────────────────────
@@ -50,11 +57,14 @@ class TradingConfig(PluginConfigBase):
     """交易参数"""
     __ui_label__ = "交易参数"
     spot_fee: float = Field(default=0.001, description="现货手续费率（0.001=0.1%）")
-    futures_fee: float = Field(default=0.0005, description="做空手续费率（0.0005=0.05%）")
+    futures_fee: float = Field(default=0.0005, description="合约手续费率（0.0005=0.05%）")
     maintenance_margin_rate: float = Field(default=0.005, description="维持保证金率（爆仓线用）")
-    default_leverage: float = Field(default=3.0, description="开空默认杠杆倍数")
+    default_leverage: float = Field(default=3.0, description="合约默认杠杆倍数")
     max_leverage: float = Field(default=20.0, description="最大允许杠杆")
+    funding_settlement: bool = Field(default=True, description="是否结算永续资金费（每 8 小时）")
+    funding_default: float = Field(default=0.0001, description="资金费率获取失败时的兜底费率（0.0001=0.01%）")
     allow_ai_short: bool = Field(default=True, description="是否允许麦麦（AI Tool）开空单")
+    allow_ai_long: bool = Field(default=True, description="是否允许麦麦（AI Tool）开多单")
     allow_ai_trade: bool = Field(default=True, description="是否允许麦麦（AI Tool）自主下单（买入/卖出）")
 
 
@@ -216,17 +226,35 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
             try:
                 await asyncio.sleep(max(1, self.config.task.tick_seconds))
                 wallets = await self.store.get_all()
-                # 1. 汇总需要查价的币种（持仓/空单/定投/警报）
+                # 1. 汇总需要查价的币种（持仓/合约/定投/警报）
                 symbols: set = set()
                 for w in wallets:
                     symbols.update(w.positions.keys())
-                    symbols.update(w.shorts.keys())
+                    symbols.update(sp.symbol for sp in w.shorts.values())
                     symbols.update(p.symbol for p in w.plans.values())
                     symbols.update(a.symbol for a in w.alerts.values())
                 prices = await self.market.get_prices(sorted(symbols)) if symbols else {}
 
                 for w in wallets:
                     changed = False
+                    # 1.5 资金费结算（8h 一次；名义按开仓价计，不依赖最新价，放最前）
+                    if (
+                        self.config.trading.funding_settlement
+                        and w.shorts and now() >= w.funding_next
+                    ):
+                        fund_syms = sorted({sp.symbol for sp in w.shorts.values()})
+                        rates: Dict[str, float] = {}
+                        for sym in fund_syms:
+                            rate = await self.market.get_funding(sym, default=self.config.trading.funding_default)
+                            if rate is not None:
+                                rates[sym] = rate
+                        events = w.settle_funding(rates)
+                        for ev in events:
+                            self.ctx.logger.info("钱包 %s 资金费: %s", w.key, ev)
+                            await self._notify(w, ev)
+                        w.funding_next = next_funding_ts(now())
+                        changed = True
+
                     # 2. 止盈止损（自动平仓）
                     events = w.check_tp_sl(prices)
                     for ev in events:
@@ -239,10 +267,13 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
                         hit = w.check_liquidation(prices)
                         for sp, mark in hit:
                             changed = True
+                            side_name = "空单" if sp.side == "short" else "多单"
+                            direct = "涨到" if sp.side == "short" else "跌到"
                             self.ctx.logger.warning("钱包 %s 爆仓: %s %.6g张 @%.6g", w.key, sp.symbol, sp.qty, mark)
                             await self._notify(w, (
                                 f"⚠️ 爆仓警报 {sp.symbol}\n"
-                                f"{sp.leverage:.0f}x 空单在 {fmt_price(mark)} 触发爆仓线 {fmt_price(sp.liquidation_price)}\n"
+                                f"{sp.leverage:g}x {side_name}在 {fmt_price(mark)} 触发爆仓线 {fmt_price(sp.liquidation_price)}"
+                                f"（价格{direct}爆仓价）\n"
                                 f"损失全部保证金 {sp.margin:,.2f} U 💀"
                             ))
 
@@ -422,7 +453,7 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
     async def _portfolio_lines(self, w: Wallet, day_scope: bool = False) -> Tuple[List[str], Dict[str, float]]:
         """生成资产总览文本行与持仓价格表。day_scope=True 额外算今日盈亏。"""
         cfg = self.config
-        symbols = sorted(set(w.positions) | set(w.shorts))
+        symbols = sorted(set(w.positions) | {sp.symbol for sp in w.shorts.values()})
         prices = await self.market.get_prices(symbols) if symbols else {}
         pos_val, missing = w.positions_value(prices)
         short_mar = w.shorts_margin()
@@ -436,7 +467,7 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
         lines.append(f"💰 总资产 {total:,.2f} U{mode_note}　收益率 {fmt_pct(pnl_pct)}")
         lines.append(f"💵 现金 {w.cash:,.2f} U　现货市值 {pos_val:,.2f} U　保证金 {short_mar:,.2f} U")
         if w.shorts:
-            lines.append(f"📉 空单浮盈 {fmt_usdt(short_upnl)} U")
+            lines.append(f"📉 合约浮盈 {fmt_usdt(short_upnl)} U")
         lines.append(f"📈 已实现盈亏 {fmt_usdt(w.realized_pnl)} U　累计手续费 {w.fees_paid:,.2f} U")
 
         if w.positions:
@@ -462,22 +493,23 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
                 )
         if w.shorts:
             lines.append("")
-            lines.append("── 空单 ──")
-            for sym, sp in sorted(w.shorts.items()):
-                p = prices.get(sym)
+            lines.append("── 合约仓位 ──")
+            for key, sp in sorted(w.shorts.items()):
+                p = prices.get(sp.symbol)
+                side_tag = "多" if sp.side == "long" else "空"
                 if p is None:
-                    lines.append(f"· {sym} 空 {fmt_qty(sp.qty)} @ {fmt_price(sp.entry_price)} {sp.leverage:.0f}x〔无行情〕")
+                    lines.append(f"· {sp.symbol} {side_tag} {fmt_qty(sp.qty)} @ {fmt_price(sp.entry_price)} {sp.leverage:g}x〔无行情〕")
                     continue
                 upnl = sp.unrealized(p)
                 pct = upnl / sp.margin * 100 if sp.margin else 0.0
-                dist = (sp.liquidation_price / p - 1) * 100 if p else 0.0
+                dist = abs(sp.liquidation_price / p - 1) * 100 if p else 0.0
                 tpsl = ""
                 if sp.tp_price > 0:
                     tpsl += f"　TP {fmt_price(sp.tp_price)}"
                 if sp.sl_price > 0:
                     tpsl += f"　SL {fmt_price(sp.sl_price)}"
                 lines.append(
-                    f"· {sym} 空 {fmt_qty(sp.qty)} @ {fmt_price(sp.entry_price)} {sp.leverage:.0f}x → {fmt_price(p)}"
+                    f"· {sp.symbol} {side_tag} {fmt_qty(sp.qty)} @ {fmt_price(sp.entry_price)} {sp.leverage:g}x → {fmt_price(p)}"
                     f"　浮盈 {fmt_usdt(upnl)} U（{fmt_pct(pct)}）　距爆仓 {dist:.1f}%{tpsl}"
                 )
         if w.plans:
@@ -531,7 +563,9 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
             return await self._cmd_sell(stream_id, rest)
         if sub in ("short", "开空", "做空", "空"):
             return await self._cmd_short(stream_id, rest)
-        if sub in ("close", "平空", "平仓"):
+        if sub in ("long", "开多", "做多", "多"):
+            return await self._cmd_long(stream_id, rest)
+        if sub in ("close", "平空", "平多", "平仓"):
             return await self._cmd_close(stream_id, rest)
         if sub in ("pos", "positions", "持仓", "仓位", "资产", "overview", "总览"):
             return await self._cmd_overview(stream_id, full=True)
@@ -573,8 +607,9 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
             "/coin price BTC           实时价格 + 24h涨跌",
             "/coin buy BTC 100u        买入100U的BTC（或 /coin buy BTC 0.01 按数量）",
             "/coin sell BTC all        卖出（all=清仓，也可写数量）",
-            "/coin short BTC 0.01 5x   开空（默认杠杆见配置，0.01张×5倍）",
-            "/coin close BTC [all|数量] 平空单",
+            "/coin short BTC 0.01 5x   开空单（默认杠杆见配置，0.01张×5倍）",
+            "/coin long BTC 500u 3x    开杠杆多单",
+            "/coin close BTC [all|数量] [long|short] 平合约单",
             "/coin pos                 持仓明细",
             "/coin history [条数]       成交记录",
             "/coin kline BTC [1h] [96] K线图",
@@ -655,9 +690,11 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
             f"本次盈亏 {fmt_usdt(t.pnl)} U　现金 {w.cash:,.2f} U"
         )
 
-    async def _cmd_short(self, stream_id: str, rest: List[str]) -> str:
+    async def _open_futures_cmd(self, stream_id: str, rest: List[str], side: str) -> str:
+        """开永续合约仓位（long/short 通用）。"""
+        side_name = "开多" if side == "long" else "开空"
         if len(rest) < 2:
-            raise UserError("用法：/coin short <币种> <数量|名义金额u> [杠杆x]  例：/coin short BTC 0.01 5x")
+            raise UserError(f"用法：/coin {'long' if side == 'long' else 'short'} <币种> <数量|名义金额u> [杠杆x]  例：/coin {'long' if side == 'long' else 'short'} BTC 500u 5x")
         sym = normalize_symbol(rest[0])
         val, is_usdt = parse_amount(rest[1])
         if val is None:
@@ -673,35 +710,59 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
         price, src = await self.market.get_price(sym)
         w = await self.store.get(stream_id)
         qty = val / price if is_usdt else val  # 金额按名义价值折算
-        t = w.open_short(
-            sym, qty, lev, price,
+        w.open_futures(
+            sym, side, qty, lev, price,
             self.config.trading.futures_fee, self.config.trading.maintenance_margin_rate,
         )
         await self.store.save(w)
-        sp = w.shorts[sym]
-        dist_pct = (sp.liquidation_price / price - 1) * 100
+        sp = w.shorts[Wallet._fut_key(sym, side)]
+        dist_pct = abs(sp.liquidation_price / price - 1) * 100
+        direct = "涨" if side == "short" else "跌"
         return (
-            f"✅ 开空 {sym} {fmt_qty(qty)} @ {fmt_price(price)} {lev:g}x（{src}）\n"
-            f"保证金 {sp.margin:,.2f} U　爆仓价 {fmt_price(sp.liquidation_price)}（还需涨 {dist_pct:.1f}%）\n"
-            f"⚠️ 价格涨到爆仓价即损失全部保证金，注意风险"
+            f"✅ {side_name} {sym} {fmt_qty(qty)} @ {fmt_price(price)} {lev:g}x（{src}）\n"
+            f"保证金 {sp.margin:,.2f} U　爆仓价 {fmt_price(sp.liquidation_price)}（{direct} {dist_pct:.1f}% 触发）\n"
+            f"⚠️ 价格{direct}到爆仓价即损失全部保证金，注意风险"
         )
+
+    async def _cmd_short(self, stream_id: str, rest: List[str]) -> str:
+        return await self._open_futures_cmd(stream_id, rest, "short")
+
+    async def _cmd_long(self, stream_id: str, rest: List[str]) -> str:
+        return await self._open_futures_cmd(stream_id, rest, "long")
 
     async def _cmd_close(self, stream_id: str, rest: List[str]) -> str:
         if not rest:
-            raise UserError("用法：/coin close <币种> [数量|all]")
+            raise UserError("用法：/coin close <币种> [数量|all] [long|short]")
         sym = normalize_symbol(rest[0])
+        side: Optional[str] = None
         qty: Optional[float] = None
-        if len(rest) >= 2 and rest[1].lower() not in ("all", "全部"):
-            qty, _ = parse_amount(rest[1])
-            if qty is None:
-                raise UserError(f"数量无效：{rest[1]}")
-        price, src = await self.market.get_price(sym)
+        for tok in rest[1:]:
+            low = tok.lower()
+            if low in ("long", "多", "多单", "l"):
+                side = "long"
+            elif low in ("short", "空", "空单", "s"):
+                side = "short"
+            elif low not in ("all", "全部"):
+                q, _ = parse_amount(low)
+                if q is None:
+                    raise UserError(f"数量无效：{tok}")
+                qty = q
         w = await self.store.get(stream_id)
-        t = w.close_short(sym, qty, price, self.config.trading.futures_fee)
+        has_long = w.shorts.get(Wallet._fut_key(sym, "long"))
+        has_short = w.shorts.get(Wallet._fut_key(sym, "short"))
+        if side is None:
+            if has_long and has_short:
+                raise UserError(f"{sym} 多空都有，请写 /coin close {sym} <数量|all> long 或 short")
+            side = "long" if has_long else "short" if has_short else None
+        if side is None:
+            raise UserError(f"没有 {sym} 的合约仓位")
+        side_name = "平多" if side == "long" else "平空"
+        price, src = await self.market.get_price(sym)
+        t = w.close_futures(sym, side, qty, price, self.config.trading.futures_fee)
         await self.store.save(w)
         mood = "😎" if t.pnl >= 0 else "🥲"
         return (
-            f"{mood} 平空 {sym} {fmt_qty(t.qty)} @ {fmt_price(price)}（{src}）\n"
+            f"{mood} {side_name} {sym} {fmt_qty(t.qty)} @ {fmt_price(price)}（{src}）\n"
             f"本次盈亏 {fmt_usdt(t.pnl)} U　现金 {w.cash:,.2f} U"
         )
 
@@ -717,12 +778,13 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
             return "📜 还没有成交记录，先 /coin buy 试试"
         acts = {
             "buy": "买入", "sell": "卖出", "short_open": "开空", "short_close": "平空",
+            "long_open": "开多", "long_close": "平多",
             "liquidated": "爆仓", "dca_buy": "定投买", "dca_skip": "定投跳过",
         }
         lines = [f"📜 最近 {min(n, len(w.trades))} 笔成交"]
         for t in reversed(w.trades[-n:]):
             act = acts.get(t.action, t.action)
-            pnl = f"　盈亏 {fmt_usdt(t.pnl)}" if t.action in ("sell", "short_close", "liquidated") else ""
+            pnl = f"　盈亏 {fmt_usdt(t.pnl)}" if t.action in ("sell", "short_close", "long_close", "liquidated") else ""
             note = f"（{t.note}）" if t.note else ""
             lines.append(f"· {fmt_ts(t.ts)} {act} {t.symbol} {fmt_qty(t.qty)} @ {fmt_price(t.price)}{pnl}{note}")
         return "\n".join(lines)
@@ -875,21 +937,25 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
         raise UserError(f"不认识的警报操作「{rest[0]}」：add / list / del")
 
     async def _cmd_tp_sl(self, stream_id: str, rest: List[str], kind: str) -> str:
-        """止盈止损：/coin tp BTC 110000 | clear。现货与空单方向自动适配。"""
+        """止盈止损：/coin tp BTC 110000 | clear。现货/多单/空单方向自动适配。"""
         kind_name = "止盈" if kind == "tp" else "止损"
         if not rest:
-            raise UserError(f"用法：/coin {kind} <币种> <价格|clear> [spot|short]")
+            raise UserError(f"用法：/coin {kind} <币种> <价格|clear> [spot|long|short]")
         sym = normalize_symbol(rest[0])
         w = await self.store.get(stream_id)
-        has_pos, has_short = sym in w.positions, sym in w.shorts
-        if not has_pos and not has_short:
-            raise UserError(f"没有 {sym} 的持仓/空单，先开仓再设{kind_name}")
+        has_pos = sym in w.positions
+        has_long = bool(w.shorts.get(Wallet._fut_key(sym, "long")))
+        has_short = bool(w.shorts.get(Wallet._fut_key(sym, "short")))
+        n_opts = sum([has_pos, has_long, has_short])
+        if n_opts == 0:
+            raise UserError(f"没有 {sym} 的持仓/合约仓位，先开仓再设{kind_name}")
         side = "auto"
-        if rest[-1].lower() in ("spot", "short"):
+        if rest[-1].lower() in ("spot", "long", "short"):
             side = rest[-1].lower()
             rest = rest[:-1]
         if len(rest) < 2:
-            raise UserError(f"用法：/coin {kind} {sym} <价格|clear>" + (" [spot|short]" if has_pos and has_short else ""))
+            hint_side = " [spot|long|short]" if n_opts > 1 else ""
+            raise UserError(f"用法：/coin {kind} {sym} <价格|clear>{hint_side}")
         raw = rest[1].lower()
         hint = ""
         if raw in ("clear", "清除", "取消"):
@@ -901,9 +967,12 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
                 raise UserError(f"价格无效：{raw}")
             if price_val <= 0:
                 raise UserError("价格要大于 0")
-            # 方向合理性提示（按当前持仓类型），只提示不阻止
+            # 方向合理性提示（按将生效的持仓类型），只提示不阻止
+            target_side = side
+            if target_side == "auto":
+                target_side = "spot" if has_pos else "long" if has_long else "short"
             cur, _ = await self.market.get_price(sym)
-            if has_pos and side != "short":
+            if target_side in ("spot", "long"):
                 expect = cur < price_val if kind == "tp" else cur > price_val
             else:
                 expect = cur > price_val if kind == "tp" else cur < price_val
@@ -914,9 +983,10 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
         except ValueError as e:
             raise UserError(str(e))
         if applied == "AMBIVALENT":
-            raise UserError(f"{sym} 同时有现货和空单，请明确写 /coin {kind} {sym} <价格> spot 或 short")
+            raise UserError(f"{sym} 同时有多种持仓，请明确写 /coin {kind} {sym} <价格> spot / long / short")
         await self.store.save(w)
-        side_name = "现货" if applied == "spot" else "空单"
+        side_names = {"spot": "现货", "long": "多单", "short": "空单"}
+        side_name = side_names.get(applied, applied)
         if price_val == 0.0:
             return f"🗑 已清除 {sym} {side_name}的{kind_name}"
         return f"✅ {sym} {side_name}{kind_name}已设：{fmt_price(price_val)}{hint}"
@@ -931,7 +1001,7 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
         symbols: set = set()
         for w in wallets:
             symbols.update(w.positions.keys())
-            symbols.update(w.shorts.keys())
+            symbols.update(sp.symbol for sp in w.shorts.values())
         prices = await self.market.get_prices(sorted(symbols)) if symbols else {}
         rows = []
         for w in wallets:
@@ -981,7 +1051,7 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
 
     @Tool(
         name="crypto_get_portfolio",
-        description="查询麦麦自己的模拟炒币账户：现金、持仓、空单、总资产和收益率。当有人问麦麦炒币炒得怎么样、看看仓位时调用。",
+        description="查询麦麦自己的模拟炒币账户：现金、持仓、合约仓位、总资产和收益率。当有人问麦麦炒币炒得怎么样、看看仓位时调用。",
         parameters=[
             ToolParameterInfo(name="stream_id", param_type=ToolParamType.STRING, description="当前聊天流ID", required=False),
         ],
@@ -997,15 +1067,15 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
     @Tool(
         name="crypto_trade",
         description=(
-            "用麦麦的模拟钱包按真实行情下单。action 可选：buy（买入）、sell（卖出）、short（开空单）、close（平空单）。"
-            "金额可用 USDT 计价（如 100u）或币量（如 0.5）。开空可带杠杆 leverage（如 5）。"
-            "当用户让麦麦买/卖/做空某个币时调用。"
+            "用麦麦的模拟钱包按真实行情下单。action 可选：buy（买入）、sell（卖出）、long（开杠杆多单）、short（开空单）、close（平合约单）。"
+            "金额可用 USDT 计价（如 100u）或币量（如 0.5）。合约可带杠杆 leverage（如 5）。"
+            "当用户让麦麦买/卖/做多/做空某个币时调用。"
         ),
         parameters=[
-            ToolParameterInfo(name="action", param_type=ToolParamType.STRING, description="buy / sell / short / close", required=True),
+            ToolParameterInfo(name="action", param_type=ToolParamType.STRING, description="buy / sell / long / short / close", required=True),
             ToolParameterInfo(name="symbol", param_type=ToolParamType.STRING, description="币种符号，如 BTC", required=True),
             ToolParameterInfo(name="amount", param_type=ToolParamType.STRING, description="数量或金额，如 100u 或 0.01", required=True),
-            ToolParameterInfo(name="leverage", param_type=ToolParamType.STRING, description="杠杆倍数（仅 short 用），如 5", required=False),
+            ToolParameterInfo(name="leverage", param_type=ToolParamType.STRING, description="杠杆倍数（仅 long/short 用），如 5", required=False),
             ToolParameterInfo(name="stream_id", param_type=ToolParamType.STRING, description="当前聊天流ID", required=False),
         ],
     )
@@ -1013,7 +1083,7 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
         cfg = self.config.trading
         action = (action or "").strip().lower()
         try:
-            args = [symbol, amount] + ([leverage + "x"] if leverage and action == "short" else [])
+            args = [symbol, amount] + ([leverage + "x"] if leverage and action in ("short", "long") else [])
             if action in ("buy", "买", "买入"):
                 if not cfg.allow_ai_trade:
                     return False, "配置未允许麦麦自主下单", 1
@@ -1026,9 +1096,13 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
                 if not cfg.allow_ai_short:
                     return False, "配置未允许麦麦开空单", 1
                 return True, await self._cmd_short(stream_id, args), 3
-            if action in ("close", "平空", "平仓"):
-                return True, await self._cmd_close(stream_id, args), 3
-            return False, f"未知 action：{action}（buy/sell/short/close）", 1
+            if action in ("long", "开多", "做多"):
+                if not cfg.allow_ai_long:
+                    return False, "配置未允许麦麦开多单", 1
+                return True, await self._cmd_long(stream_id, args), 3
+            if action in ("close", "平空", "平仓", "平多"):
+                return True, await self._cmd_close(stream_id, [symbol] + amount.split()), 3
+            return False, f"未知 action：{action}（buy/sell/long/short/close）", 1
         except ValueError as e:
             return False, str(e), 1
         except Exception as e:  # noqa: BLE001

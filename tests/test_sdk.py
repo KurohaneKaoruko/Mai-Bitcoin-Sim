@@ -152,8 +152,23 @@ async def main():
     ok, msg, _ = await run_cmd("short ETH 100u 3x")
     check("开空 3x", ok and "开空" in msg and "爆仓" in msg, msg)
 
+    ok, msg, _ = await run_cmd("long ETH 200u 5x")
+    check("开多 5x", ok and "开多" in msg and "爆仓" in msg, msg)
+
+    ok, msg, _ = await run_cmd("pos")
+    check("多空并存总览", ok and "多" in msg and "空" in msg and "合约" in msg, msg)
+
+    ok, msg, _ = await run_cmd("close ETH short")
+    check("指定 side 平空", ok and "平空" in msg, msg)
+
     ok, msg, _ = await run_cmd("close ETH")
-    check("平空", ok and "平空" in msg, msg)
+    check("自动 side 平多", ok and "平多" in msg, msg)
+
+    ok, msg, _ = await run_cmd("long BTC 100u 2x")
+    check("再开多（备资金费测试）", ok and "开多" in msg, msg)
+
+    ok, msg, _ = await run_cmd("close BTC")
+    check("平掉备仓", ok and "平多" in msg, msg)
 
     ok, msg, _ = await run_cmd("dca add BTC 100u 0.5h")
     check("添加定投", ok and "定投" in msg, msg)
@@ -161,8 +176,8 @@ async def main():
     ok, msg, _ = await run_cmd("dca list")
     check("定投列表", ok and "BTC" in msg)
 
-    ok, msg, _ = await run_cmd("history 5")
-    check("成交记录", ok and "买入" in msg)
+    ok, msg, _ = await run_cmd("history 10")
+    check("成交记录", ok and ("买入" in msg and "开空" in msg and "开多" in msg), msg)
 
     ok, msg, _ = await run_cmd("source")
     check("测速", ok and ("ms" in msg or "不可达" in msg))
@@ -189,6 +204,13 @@ async def main():
     # 警报触发路径：设一个立刻会触发的（低价的 >=），跑一轮巡检
     ok, msg, _ = await run_cmd("alert add BTC >= 1")
     check("添加必触发警报", ok)
+    # 同时备一个已到期的资金费结算（有合约仓位才会结算）
+    ok, msg, _ = await run_cmd("long BTC 100u 3x")
+    check("开多备资金费", ok)
+    w_g = await p.store.get("s1")
+    w_g.funding_next = 1  # 已过期 → 巡检首轮就结算
+    await p.store.save(w_g)
+    await p.market.get_funding("BTC", default=p.config.trading.funding_default)  # 预热缓存，结算路径不再依赖网络时延
     p._tick_task.cancel()
     try:
         await p._tick_task
@@ -199,11 +221,17 @@ async def main():
     await asyncio.sleep(2.5)
     texts_all = [t[1] for t in ctx.send.sent if t[0] == "text"]
     check("警报触发通知", any("价格警报" in t for t in texts_all), str(texts_all[-2:]))
+    check("资金费结算通知", any("资金费" in t for t in texts_all), str(texts_all[-2:]))
+    w_g2 = await p.store.get("s1")
+    check("结算后 funding_next 推进", w_g2.funding_next > int(__import__("time").time()), str(w_g2.funding_next))
+    check("多单付/收资金费记录", any("资金费" in t and "多" in t for t in texts_all), str(texts_all[-2:]))
     tick_fast.cancel()
     try:
         await tick_fast
     except asyncio.CancelledError:
         pass
+    ok, msg, _ = await run_cmd("close BTC")
+    check("平掉资金费测试仓", ok and "平多" in msg, msg)
     p.config.task.tick_seconds = 60
     p._tick_task = asyncio.create_task(p._background_loop())
 
@@ -259,8 +287,18 @@ async def main():
     check("tool 买入", ok and "买入" in msg, msg)
     ok, msg, _ = await p.tool_trade(action="short", symbol="ETH", amount="100u", leverage="5", stream_id="s1")
     check("tool 开空", ok and "开空" in msg, msg)
+    ok, msg, _ = await p.tool_trade(action="long", symbol="ETH", amount="50u", leverage="2", stream_id="s1")
+    check("tool 开多", ok and "开多" in msg, msg)
+    ok, msg, _ = await p.tool_trade(action="close", symbol="ETH", amount="all", leverage="", stream_id="s1")
+    check("tool 平空（多空并存报错）", (not ok and "多空都有" in msg), msg)
+    ok, msg, _ = await p.tool_trade(action="short", symbol="SOL", amount="10u", leverage="2", stream_id="s1")
+    check("tool 开空 SOL", ok and "开空" in msg, msg)
+    ok, msg, _ = await p.tool_trade(action="close", symbol="SOL", amount="all", stream_id="s1")
+    check("tool 平空（单侧）", ok and "平空" in msg, msg)
+    ok, msg, _ = await p.tool_trade(action="close", symbol="ETH", amount="all short", stream_id="s1")
+    check("tool 平空（明确 short）", ok and "平空" in msg, msg)
     ok, msg, _ = await p.tool_trade(action="close", symbol="ETH", amount="all", stream_id="s1")
-    check("tool 平空", ok and "平空" in msg, msg)
+    check("tool 平多（自动 side）", ok and "平多" in msg, msg)
     ok, msg, _ = await p.tool_market_overview()
     check("tool 大盘", ok and "BTC" in msg)
 

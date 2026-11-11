@@ -60,21 +60,26 @@ class Trade:
 
 
 @dataclass
-class ShortPosition:
+class FuturesPosition:
+    """永续合约仓位（支持多/空）。"""
+
     symbol: str
-    qty: float               # 做空数量（正数表示空头头寸大小）
+    side: str                # "long" / "short"
+    qty: float               # 仓位大小（正数）
     entry_price: float
     leverage: float
     margin: float            # 占用保证金
     liquidation_price: float
     opened_at: int = field(default_factory=now)
     note: str = ""
-    tp_price: float = 0.0    # 止盈价（<=0 = 未设）；标记价 <= tp 触发平空
-    sl_price: float = 0.0    # 止损价（<=0 = 未设）；标记价 >= sl 触发平空
+    tp_price: float = 0.0    # 止盈价（<=0 = 未设）
+    sl_price: float = 0.0    # 止损价（<=0 = 未设）
+    funding_paid: float = 0.0  # 累计已付资金费（正=付出，负=收到）
 
     def unrealized(self, mark: float) -> float:
-        """按标记价计算浮盈（正=赚）。"""
-        return fnum((self.entry_price - mark) * self.qty)
+        """按标记价计算浮盈（正=赚）。多：mark-entry；空：entry-mark。"""
+        diff = (mark - self.entry_price) if self.side == "long" else (self.entry_price - mark)
+        return fnum(diff * self.qty)
 
 
 @dataclass
@@ -105,7 +110,7 @@ class DCAPlan:
 
 
 class Wallet:
-    """一个钱包 = 现金 + 现货持仓 + 空单 + 成交记录 + 定投计划 + 快照。"""
+    """一个钱包 = 现金 + 现货持仓 + 合约仓位(多/空) + 成交记录 + 定投计划 + 快照。"""
 
     MAX_TRADES = 200
     MAX_SNAPSHOTS = 1000
@@ -117,7 +122,9 @@ class Wallet:
         self.created_at = created_at or now()
         # positions: {symbol: {"qty": float, "avg_cost": float, "tp_price": float, "sl_price": float}}
         self.positions: Dict[str, Dict[str, float]] = {}
-        self.shorts: Dict[str, ShortPosition] = {}
+        # 合约仓位（多/空），key: "SYMBOL|L" / "SYMBOL|S"；字段名沿用 shorts 兼容旧数据
+        self.shorts: Dict[str, FuturesPosition] = {}
+        self.funding_next: int = 0   # 下次资金费结算时间戳（0=未排期）
         self.trades: List[Trade] = []
         self.plans: Dict[str, DCAPlan] = {}
         self.alerts: Dict[str, PriceAlert] = {}
@@ -177,27 +184,59 @@ class Wallet:
     ) -> Trade:
         if symbol in self.shorts:
             raise ValueError(f"{symbol} 已有空单（一次只允许一张，先平仓再加仓）")
+    def open_futures(
+        self, symbol: str, side: str, qty: float, leverage: float, price: float,
+        fee_rate: float, mmr: float, note: str = "",
+    ) -> Trade:
+        """开永续合约仓位。side: "long"/"short"。"""
+        if side not in ("long", "short"):
+            raise ValueError("side 必须是 long 或 short")
+        key = self._fut_key(symbol, side)
+        if key in self.shorts:
+            side_name = "多单" if side == "long" else "空单"
+            raise ValueError(f"{symbol} 已有{side_name}（一次一张，先平仓再加仓）")
         if leverage < 1 or leverage > 125:
             raise ValueError("杠杆倍数需在 1~125 之间")
         notional = qty * price
         margin = notional / leverage
         fee = notional * fee_rate
+        side_name = "开多" if side == "long" else "开空"
         if margin + fee > self.cash + EPS:
             raise ValueError(
-                f"现金不足：开空需要保证金 {margin:,.2f} U + 手续费 {fee:,.2f} U，可用 {self.cash:,.2f} U"
+                f"现金不足：{side_name}需要保证金 {margin:,.2f} U + 手续费 {fee:,.2f} U，可用 {self.cash:,.2f} U"
             )
-        liq = price * (1 + 1.0 / leverage - mmr)
+        # 爆仓价：空在上方 entry*(1+1/lev-mmr)，多在下方 entry*(1-1/lev+mmr)
+        if side == "short":
+            liq = price * (1 + 1.0 / leverage - mmr)
+        else:
+            liq = price * (1 - 1.0 / leverage + mmr)
         self.cash -= margin + fee
-        self.shorts[symbol] = ShortPosition(symbol, qty, price, leverage, margin, liq, note=note)
+        self.shorts[key] = FuturesPosition(symbol, side, qty, price, leverage, margin, liq, note=note)
         self.fees_paid += fee
-        t = Trade("short_open", symbol, qty, price, notional, fee, note=f"lev={leverage:.0f}x liq@{liq:,.6g}")
+        action = "long_open" if side == "long" else "short_open"
+        t = Trade(action, symbol, qty, price, notional, fee, note=f"lev={leverage:g}x liq@{liq:,.6g}")
         self._push(t)
         return t
 
-    def close_short(self, symbol: str, qty_requested: Optional[float], price: float, fee_rate: float, note: str = "") -> Trade:
-        sp = self.shorts.get(symbol)
+    def open_short(self, symbol: str, qty: float, leverage: float, price: float,
+                   fee_rate: float, mmr: float, note: str = "") -> Trade:
+        return self.open_futures(symbol, "short", qty, leverage, price, fee_rate, mmr, note)
+
+    def open_long(self, symbol: str, qty: float, leverage: float, price: float,
+                  fee_rate: float, mmr: float, note: str = "") -> Trade:
+        return self.open_futures(symbol, "long", qty, leverage, price, fee_rate, mmr, note)
+
+    @staticmethod
+    def _fut_key(symbol: str, side: str) -> str:
+        return f"{symbol}|{'L' if side == 'long' else 'S'}"
+
+    def close_futures(self, symbol: str, side: str, qty_requested: Optional[float], price: float,
+                      fee_rate: float, note: str = "") -> Trade:
+        key = self._fut_key(symbol, side)
+        sp = self.shorts.get(key)
+        side_name = "多单" if side == "long" else "空单"
         if not sp:
-            raise ValueError(f"没有 {symbol} 空单")
+            raise ValueError(f"没有 {symbol} {side_name}")
         qty = sp.qty if qty_requested is None or qty_requested >= sp.qty * ALL_RATIO_TOLERANCE else qty_requested
         qty = min(qty, sp.qty)
         if qty <= EPS:
@@ -205,31 +244,76 @@ class Wallet:
         ratio = qty / sp.qty
         notional = qty * price
         fee = notional * fee_rate
-        pnl = fnum((sp.entry_price - price) * qty)
+        diff = (price - sp.entry_price) if sp.side == "long" else (sp.entry_price - price)
+        pnl = fnum(diff * qty)
         margin_back = sp.margin * ratio
+        # 资金费在结算时已实时进出现金，平仓不再重复结算；funding_paid 仅随仓位等比核销（信息性）
+        funding_share = sp.funding_paid * ratio
         self.cash += margin_back + pnl - fee
         self.realized_pnl += pnl
         self.fees_paid += fee
         sp.qty = fnum(sp.qty - qty)
         sp.margin = fnum(sp.margin - margin_back)
+        sp.funding_paid = fnum(sp.funding_paid - funding_share)
         if sp.qty <= EPS or sp.margin <= EPS:
-            del self.shorts[symbol]
-        t = Trade("short_close", symbol, qty, price, notional, fee, pnl=pnl, note=note or f"lev={sp.leverage:.0f}x")
+            del self.shorts[key]
+        action = "long_close" if sp.side == "long" else "short_close"
+        t = Trade(action, symbol, qty, price, notional, fee, pnl=pnl,
+                  note=note or f"lev={sp.leverage:g}x")
         self._push(t)
         return t
 
-    def check_liquidation(self, prices: Dict[str, float]) -> List[Tuple[ShortPosition, float]]:
-        """检查爆仓：标记价 >= 爆仓价 → 没收全部保证金。返回被爆空单与爆仓价。"""
-        hit: List[Tuple[ShortPosition, float]] = []
-        for sym in list(self.shorts.keys()):
-            sp = self.shorts[sym]
-            mark = prices.get(sym)
-            if mark is not None and mark >= sp.liquidation_price:
-                del self.shorts[sym]
+    def close_short(self, symbol: str, qty_requested: Optional[float], price: float, fee_rate: float, note: str = "") -> Trade:
+        return self.close_futures(symbol, "short", qty_requested, price, fee_rate, note)
+
+    def close_long(self, symbol: str, qty_requested: Optional[float], price: float, fee_rate: float, note: str = "") -> Trade:
+        return self.close_futures(symbol, "long", qty_requested, price, fee_rate, note)
+
+    def settle_funding(self, funding_rates: Dict[str, float], max_pct: float = 0.05) -> List[str]:
+        """按各币种资金费率结算所有合约仓位（真实规则简化：多头付 rate、空头收 rate）。
+
+        金额 = 名义价值(按开仓价) × rate，直接从现金扣/加。
+        返回结算描述列表。
+        """
+        events: List[str] = []
+        for key, sp in list(self.shorts.items()):
+            rate = funding_rates.get(sp.symbol)
+            if rate is None:
+                continue
+            rate = max(-max_pct, min(max_pct, rate))  # 防御异常费率
+            notional = sp.qty * sp.entry_price
+            amount = notional * rate
+            if sp.side == "long":
+                self.cash -= amount          # 多头：rate>0 付费，rate<0 收取
+                sp.funding_paid = fnum(sp.funding_paid + amount)
+                who = "支付" if amount >= 0 else "收取"
+            else:
+                self.cash += amount          # 空头：rate>0 收取，rate<0 付费
+                sp.funding_paid = fnum(sp.funding_paid - amount)
+                who = "收取" if amount >= 0 else "支付"
+            events.append(
+                f"💸 资金费：{sp.symbol} {('多' if sp.side == 'long' else '空')}单 {who} {abs(amount):,.2f} U"
+                f"（费率 {rate * 100:+.4f}%）"
+            )
+        return events
+
+    def check_liquidation(self, prices: Dict[str, float]) -> List[Tuple[FuturesPosition, float]]:
+        """检查爆仓：空单 mark >= 爆仓价；多单 mark <= 爆仓价。没收全部保证金。"""
+        hit: List[Tuple[FuturesPosition, float]] = []
+        for key in list(self.shorts.keys()):
+            sp = self.shorts[key]
+            mark = prices.get(sp.symbol)
+            if mark is None:
+                continue
+            blown = mark >= sp.liquidation_price if sp.side == "short" else mark <= sp.liquidation_price
+            if blown:
+                del self.shorts[key]
                 self.realized_pnl -= sp.margin
+                side_name = "空单" if sp.side == "short" else "多单"
                 t = Trade(
-                    "liquidated", sym, sp.qty, mark, sp.qty * mark, 0.0,
-                    pnl=-sp.margin, note=f"{sp.leverage:.0f}x 空单爆仓，损失全部保证金 {sp.margin:,.2f} U",
+                    "liquidated", sp.symbol, sp.qty, mark, sp.qty * mark, 0.0,
+                    pnl=-sp.margin,
+                    note=f"{sp.leverage:g}x {side_name}爆仓，损失全部保证金 {sp.margin:,.2f} U",
                 )
                 self._push(t)
                 hit.append((sp, mark))
@@ -259,31 +343,40 @@ class Wallet:
             pnl = fnum((mark - avg) * qty)
             self.sell(sym, None, mark, 0.0, note=f"auto:{hit_kind}")
             events.append(f"🎯 现货{hit_kind}：{sym} {fmt_qty_local(qty)} @ {mark:,.6g}（盈亏 {pnl:+,.2f} U）")
-        # 空单
-        for sym in list(self.shorts.keys()):
-            sp = self.shorts[sym]
-            mark = prices.get(sym)
+        # 合约仓位（多/空）
+        for key in list(self.shorts.keys()):
+            sp = self.shorts[key]
+            mark = prices.get(sp.symbol)
             if mark is None:
                 continue
+            side_name = "多单" if sp.side == "long" else "空单"
             hit_kind = ""
-            if sp.tp_price > 0 and mark <= sp.tp_price:
-                hit_kind = "止盈"
-            elif sp.sl_price > 0 and mark >= sp.sl_price:
-                hit_kind = "止损"
+            if sp.tp_price > 0:
+                # 多单 tp 在上方、空单 tp 在下方
+                hit_tp = mark >= sp.tp_price if sp.side == "long" else mark <= sp.tp_price
+                if hit_tp:
+                    hit_kind = "止盈"
+            if not hit_kind and sp.sl_price > 0:
+                hit_sl = mark <= sp.sl_price if sp.side == "long" else mark >= sp.sl_price
+                if hit_sl:
+                    hit_kind = "止损"
             if not hit_kind:
                 continue
-            t = self.close_short(sym, None, mark, 0.0, note=f"auto:{hit_kind}")
-            events.append(f"🎯 空单{hit_kind}：{sym} {fmt_qty_local(sp.qty)} @ {mark:,.6g}（盈亏 {t.pnl:+,.2f} U）")
+            qty = sp.qty
+            t = self.close_futures(sp.symbol, sp.side, None, mark, 0.0, note=f"auto:{hit_kind}")
+            events.append(f"🎯 {side_name}{hit_kind}：{sp.symbol} {fmt_qty_local(qty)} @ {mark:,.6g}（盈亏 {t.pnl:+,.2f} U）")
         return events
 
     def set_tp_sl(self, symbol: str, tp: float = 0.0, sl: float = 0.0, side: str = "auto") -> str:
-        """给现货或空单设置止盈/止损价（0=清除）。side: auto/spot/short。返回操作描述。"""
+        """给现货或合约仓位设置止盈/止损价（0=清除）。side: auto/spot/long/short。返回实际 side。"""
         has_pos = symbol in self.positions
-        has_short = symbol in self.shorts
+        fut_long = self.shorts.get(self._fut_key(symbol, "long"))
+        fut_short = self.shorts.get(self._fut_key(symbol, "short"))
         if side == "auto":
-            if has_pos and has_short:
-                return "AMBIVALENT"  # 同时持有时需明确 side
-            side = "spot" if has_pos else "short" if has_short else ""
+            options = [s for s, p in (("spot", has_pos), ("long", fut_long), ("short", fut_short)) if p]
+            if len(options) > 1:
+                return "AMBIVALENT"  # 多种持仓并存时需明确 side
+            side = options[0] if options else ""
         if side == "spot":
             if not has_pos:
                 raise ValueError(f"没有 {symbol} 现货持仓")
@@ -291,13 +384,15 @@ class Wallet:
             pos["tp_price"] = tp
             pos["sl_price"] = sl
             return "spot"
-        if side == "short":
-            if not has_short:
-                raise ValueError(f"没有 {symbol} 空单")
-            self.shorts[symbol].tp_price = tp
-            self.shorts[symbol].sl_price = sl
-            return "short"
-        raise ValueError(f"没有 {symbol} 的持仓/空单")
+        if side in ("long", "short"):
+            sp = self.shorts.get(self._fut_key(symbol, side))
+            if not sp:
+                side_name = "多单" if side == "long" else "空单"
+                raise ValueError(f"没有 {symbol} {side_name}")
+            sp.tp_price = tp
+            sp.sl_price = sl
+            return side
+        raise ValueError(f"没有 {symbol} 的持仓/合约仓位")
 
     # ── 定投 ──
 
@@ -328,10 +423,10 @@ class Wallet:
 
     def shorts_unrealized(self, prices: Dict[str, float]) -> Tuple[float, List[str]]:
         total, missing = 0.0, []
-        for sym, sp in self.shorts.items():
-            p = prices.get(sym)
+        for sp in self.shorts.values():
+            p = prices.get(sp.symbol)
             if p is None:
-                missing.append(sym)
+                missing.append(sp.symbol)
             else:
                 total += sp.unrealized(p)
         return fnum(total), missing
@@ -366,6 +461,7 @@ class Wallet:
             "created_at": self.created_at,
             "positions": self.positions,
             "shorts": {k: vars(sp) for k, sp in self.shorts.items()},
+            "funding_next": self.funding_next,
             "trades": [t.to_dict() for t in self.trades],
             "plans": {k: vars(p) for k, p in self.plans.items()},
             "alerts": {k: vars(a) for k, a in self.alerts.items()},
@@ -387,16 +483,22 @@ class Wallet:
                 "sl_price": float(v.get("sl_price", 0) or 0),
             } for k, v in d.get("positions", {}).items()
         }
-        w.shorts = {
-            k: ShortPosition(
-                symbol=v["symbol"], qty=float(v["qty"]), entry_price=float(v["entry_price"]),
+        def _load_fut(k: str, v: Dict[str, Any]) -> Tuple[str, FuturesPosition]:
+            side = v.get("side")
+            if side not in ("long", "short"):  # 旧格式：key 是裸 symbol，一律视为空单
+                side = "short"
+            key = k if "|" in k else cls._fut_key(v["symbol"], side)
+            return key, FuturesPosition(
+                symbol=v["symbol"], side=side, qty=float(v["qty"]), entry_price=float(v["entry_price"]),
                 leverage=float(v["leverage"]), margin=float(v["margin"]),
                 liquidation_price=float(v["liquidation_price"]), opened_at=int(v.get("opened_at", 0)),
                 note=v.get("note", ""),
                 tp_price=float(v.get("tp_price", 0) or 0),
                 sl_price=float(v.get("sl_price", 0) or 0),
-            ) for k, v in d.get("shorts", {}).items()
-        }
+                funding_paid=float(v.get("funding_paid", 0) or 0),
+            )
+        w.shorts = dict(_load_fut(k, v) for k, v in d.get("shorts", {}).items())
+        w.funding_next = int(d.get("funding_next", 0) or 0)
         w.trades = [
             Trade(
                 action=t["action"], symbol=t["symbol"], qty=float(t["qty"]), price=float(t["price"]),

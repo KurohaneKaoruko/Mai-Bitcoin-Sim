@@ -92,6 +92,7 @@ class ExchangeSource:
 class BinanceSource(ExchangeSource):
     name = "Binance"
     _base = "https://data-api.binance.vision"
+    _fapi = "https://fapi.binance.com"
 
     def symbol(self, base: str) -> str:
         return f"{base.upper()}USDT"
@@ -99,6 +100,11 @@ class BinanceSource(ExchangeSource):
     async def get_price(self, base: str) -> float:
         data = await fetch_json(f"{self._base}/api/v3/ticker/price?symbol={self.symbol(base)}")
         return float(data["price"])
+
+    async def get_funding(self, base: str) -> float:
+        """永续合约当前资金费率（Binance USDT-M fapi）。"""
+        data = await fetch_json(f"{self._fapi}/fapi/v1/premiumIndex?symbol={self.symbol(base)}")
+        return float(data["lastFundingRate"])
 
     async def get_ticker24h(self, base: str) -> Ticker24h:
         d = await fetch_json(f"{self._base}/api/v3/ticker/24hr?symbol={self.symbol(base)}")
@@ -131,6 +137,16 @@ class OkxSource(ExchangeSource):
         if not rows:
             raise RuntimeError("OKX: symbol not found")
         return float(rows[0]["last"])
+
+    async def get_funding(self, base: str) -> float:
+        """永续合约当前资金费率（OKX USDT 永续）。"""
+        data = await fetch_json(
+            f"{self._base}/api/v5/public/funding-rate?instId={base.upper()}-USDT-SWAP"
+        )
+        rows = data.get("data") or []
+        if not rows:
+            raise RuntimeError("OKX: swap not found")
+        return float(rows[0]["fundingRate"])
 
     async def get_ticker24h(self, base: str) -> Ticker24h:
         data = await fetch_json(f"{self._base}/api/v5/market/ticker?instId={self.symbol(base)}")
@@ -173,6 +189,14 @@ class GateSource(ExchangeSource):
         if not rows:
             raise RuntimeError("Gate: symbol not found")
         return float(rows[0]["last"])
+
+    async def get_funding(self, base: str) -> float:
+        """永续合约当前资金费率（Gate USDT 永续）。"""
+        d = await fetch_json(f"{self._base}/api/v4/futures/usdt/contracts/{self.symbol(base)}")
+        rate = d.get("funding_rate") or d.get("funding_rate_indicative")
+        if rate is None:
+            raise RuntimeError("Gate: no funding rate")
+        return float(rate)
 
     async def get_ticker24h(self, base: str) -> Ticker24h:
         rows = await fetch_json(f"{self._base}/api/v4/spot/tickers?currency_pair={self.symbol(base)}")
@@ -240,16 +264,20 @@ class CoinbaseSource(ExchangeSource):
 class MarketAggregator:
     """多交易所聚合：测速排序 → 主源优先、失败降级。"""
 
-    def __init__(self, price_ttl: float = 10.0, ticker_ttl: float = 30.0, kline_ttl: float = 60.0):
+    def __init__(self, price_ttl: float = 10.0, ticker_ttl: float = 30.0, kline_ttl: float = 60.0,
+                 funding_ttl: float = 600.0):
         self.sources: List[ExchangeSource] = [BinanceSource(), OkxSource(), GateSource(), CoinbaseSource()]
         self._order: List[str] = [s.name for s in self.sources]
         self.price_ttl = price_ttl
         self.ticker_ttl = ticker_ttl
         self.kline_ttl = kline_ttl
+        self.funding_ttl = funding_ttl
         # cache: key -> (expires_at, value)
         self._cache: Dict[str, Tuple[float, Any]] = {}
         # 各源最近延迟（毫秒），-1 = 不可用
         self.latency: Dict[str, float] = {s.name: -1.0 for s in self.sources}
+        # funding 源独立可用性：spot 可达 ≠ fapi 可达，记忆上次成功的源
+        self._funding_ok: Optional[str] = None
         self._lock = asyncio.Lock()
 
     # ── 测速 ──────────────────────────────────────────────
@@ -313,6 +341,61 @@ class MarketAggregator:
                 errors.append(f"{src.name}: {e}")
                 continue
         raise RuntimeError("；".join(errors) or "无可用行情源")
+
+    async def get_funding(self, base: str, default: Optional[float] = None) -> Optional[float]:
+        """返回永续资金费率；数据源都失败时返回 default。
+
+        spot 可达 ≠ fapi 可达，因此 funding 源独立选择：
+        有记忆（上次成功的源）直连；否则并发发起、先成功者胜（不等慢源）。
+        """
+        base = base.upper().strip()
+        key = f"f:{base}"
+        hit = self._cache_get(key)
+        if hit is not None:
+            return hit
+        srcs = [s for s in self._pick() if callable(getattr(s, "get_funding", None))]
+        rate: Optional[float] = None
+
+        async def _try(src) -> Tuple[str, Optional[float]]:
+            try:
+                return src.name, await src.get_funding(base)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("get_funding %s via %s 失败: %s", base, src.name, e)
+                return src.name, None
+
+        cached_ok = self._funding_ok
+        if cached_ok:
+            by_name = {s.name: s for s in srcs}
+            src = by_name.get(cached_ok)
+            if src:
+                _, rate = await _try(src)
+                if rate is None:
+                    cached_ok = None  # 上次的源也失效，退回竞速
+        if rate is None and not cached_ok and srcs:
+            tasks = {asyncio.create_task(_try(s)) for s in srcs}
+            pending = set(tasks)
+            try:
+                while pending:
+                    done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                    for t in done:
+                        name, r = t.result()
+                        if r is not None:
+                            self._funding_ok = name
+                            rate = r
+                            break
+                    if rate is not None:
+                        break
+            finally:
+                for t in pending:
+                    t.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+        if rate is not None:
+            self._cache_put(key, rate, self.funding_ttl)
+            return rate
+        if default is not None:
+            self._cache_put(key, default, min(self.funding_ttl, 60.0))
+        return default
 
     async def get_ticker24h(self, base: str) -> Ticker24h:
         base = base.upper().strip()
