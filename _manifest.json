@@ -1,0 +1,41 @@
+{
+  "manifest_version": 2,
+  "id": "kurohanekaoruko.mai-bitcoin-sim",
+  "version": "0.1.0",
+  "name": "麦麦炒币模拟器",
+  "description": "让麦麦用真实加密货币行情在本地模拟下单：现货买卖、杠杆做空、爆仓、定投、K线图与资产曲线，支持多交易所行情源自动测速切换。",
+  "author": {
+    "name": "KurohaneKaoruko",
+    "url": "https://github.com/KurohaneKaoruko"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/KurohaneKaoruko/Mai-Bitcoin-Sim",
+    "homepage": "https://github.com/KurohaneKaoruko/Mai-Bitcoin-Sim",
+    "documentation": "https://github.com/KurohaneKaoruko/Mai-Bitcoin-Sim/blob/main/README.md",
+    "issues": "https://github.com/KurohaneKaoruko/Mai-Bitcoin-Sim/issues"
+  },
+  "host_application": {
+    "min_version": "1.4.0",
+    "max_version": "1.4.99"
+  },
+  "sdk": {
+    "min_version": "2.0.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "capabilities": [
+    "send.text",
+    "send.image",
+    "render.html2png",
+    "chat.get_stream_by_group_id",
+    "chat.get_stream_by_user_id"
+  ],
+  "plugin_type": "game",
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  }
+}
