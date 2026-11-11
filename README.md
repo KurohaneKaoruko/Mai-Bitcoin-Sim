@@ -8,7 +8,7 @@
 
 - 📡 **真实行情**：接入 Binance / OKX / Gate.io / Coinbase 四家公共行情 API（无需 API key），启动自动测速选最快的源，失败自动降级
 - 💰 **现货交易**：按数量或金额（`100u`）买入、卖出、清仓
-- 📉 **永续合约**：杠杆做多/做空、双向爆仓线实时监控与主动告警、资金费每 8 小时按真实费率结算
+- 📉 **永续合约**：杠杆做多/做空、双向爆仓监控与主动告警（含临近预警）、资金费每 8 小时按真实费率结算
 - 🎯 **止盈止损**：现货与合约仓位均支持，后台巡检自动平仓
 - 🔔 **价格警报**：上穿/下破目标价自动提醒（含 AI Tool，可对话式设置）
 - 🔁 **定投计划**：周期自动买入（DCA），可暂停/恢复/删除
@@ -36,7 +36,8 @@ git clone https://github.com/KurohaneKaoruko/Mai-Bitcoin-Sim.git plugins/mai-bit
 |---|---|
 | `/coin` | 资产总览（现金/持仓/空单/收益率） |
 | `/coin help` | 帮助 |
-| `/coin price BTC` | 实时价格 + 24h 涨跌（支持中文币名：`/coin price 比特币`） |
+| `/coin price BTC [ETH...]` | 实时价格 + 24h 涨跌（多币可一起查；支持中文币名：`/coin price 比特币`） |
+| `/coin funding [BTC]` | 当前资金费率（缺省 = 持仓币种） |
 | `/coin buy BTC 100u` | 买入 100 U 的 BTC（`/coin buy BTC 0.01` 按数量） |
 | `/coin sell BTC all` | 卖出（`all` 清仓，或写数量） |
 | `/coin short ETH 100u 5x` | 合约开空：名义 100U × 5 倍杠杆 |
@@ -78,6 +79,7 @@ git clone https://github.com/KurohaneKaoruko/Mai-Bitcoin-Sim.git plugins/mai-bit
 | `chart.kline_interval` / `kline_limit` | `1h` / `72` | 默认 K 线参数 |
 | `task.tick_seconds` | `60` | 后台巡检间隔（资金费/爆仓/止盈止损/警报/定投/快照） |
 | `task.liquidation_alert` | `true` | 爆仓主动告警 |
+| `task.liquidation_near_pct` | `10` | 临近爆仓预警阈值（距爆仓价 %，0=关闭，每仓 30 分钟最多一次） |
 | `task.daily_report` | `true` | 每日收益报告 |
 | `task.report_hour` | `20` | 每日报告发送时间（24h 制） |
 | `task.alert_targets` | `[]` | 主动通知（爆仓/定投异常）发送目标：群号或QQ号列表；留空则发给钱包最近活跃的聊天流 |

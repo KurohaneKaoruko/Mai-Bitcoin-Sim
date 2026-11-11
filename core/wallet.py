@@ -130,6 +130,7 @@ class Wallet:
         self.alerts: Dict[str, PriceAlert] = {}
         self.realized_pnl = 0.0
         self.fees_paid = 0.0
+        self.funding_total: float = 0.0   # 累计净支付资金费（正=付出，负=收到）
         self.snapshots: List[List[float]] = []   # [ts, total_value]
         self.last_stream_id: str = ""
 
@@ -291,6 +292,8 @@ class Wallet:
                 self.cash += amount          # 空头：rate>0 收取，rate<0 付费
                 sp.funding_paid = fnum(sp.funding_paid - amount)
                 who = "收取" if amount >= 0 else "支付"
+            self.funding_total = fnum(self.funding_total + amount if sp.side == "long"
+                                      else self.funding_total - amount)
             events.append(
                 f"💸 资金费：{sp.symbol} {('多' if sp.side == 'long' else '空')}单 {who} {abs(amount):,.2f} U"
                 f"（费率 {rate * 100:+.4f}%）"
@@ -467,6 +470,7 @@ class Wallet:
             "alerts": {k: vars(a) for k, a in self.alerts.items()},
             "realized_pnl": self.realized_pnl,
             "fees_paid": self.fees_paid,
+            "funding_total": self.funding_total,
             "snapshots": self.snapshots,
             "last_stream_id": self.last_stream_id,
         }
@@ -523,6 +527,7 @@ class Wallet:
         }
         w.realized_pnl = float(d.get("realized_pnl", 0.0))
         w.fees_paid = float(d.get("fees_paid", 0.0))
+        w.funding_total = float(d.get("funding_total", 0.0))
         w.snapshots = [[float(a), float(b)] for a, b in d.get("snapshots", [])]
         w.last_stream_id = d.get("last_stream_id", "")
         return w

@@ -191,6 +191,15 @@ async def main():
     check("reset 确认执行", ok and "重置" in msg)
 
     print("[新功能命令]")
+    ok, msg, _ = await run_cmd("price BTC ETH")
+    check("多币查价", ok and "BTC" in msg and "ETH" in msg and msg.count("\n") >= 1, msg)
+
+    ok, msg, _ = await run_cmd("funding BTC")
+    check("funding 指定币种", ok and "资金费率" in msg and "%" in msg, msg)
+
+    ok, msg, _ = await run_cmd("funding")
+    check("funding 无仓位无参数报错", not ok and "用法" in msg, msg)
+
     ok, msg, _ = await run_cmd("alert add BTC >= 99999999")
     check("添加价格警报", ok and "警报已设" in msg, msg)
     ok, msg, _ = await run_cmd("alert")
@@ -205,8 +214,12 @@ async def main():
     ok, msg, _ = await run_cmd("alert add BTC >= 1")
     check("添加必触发警报", ok)
     # 同时备一个已到期的资金费结算（有合约仓位才会结算）
-    ok, msg, _ = await run_cmd("long BTC 100u 3x")
+    ok, msg, _ = await run_cmd("long BTC 100u 20x")
     check("开多备资金费", ok)
+    ok, msg, _ = await run_cmd("funding")
+    check("funding 缺省=持仓币种", ok and "BTC" in msg and "资金费率" in msg, msg)
+    ok, msg, _ = await run_cmd("pos")
+    check("总览含累计资金费", ok and "累计资金费" in msg, msg)
     w_g = await p.store.get("s1")
     w_g.funding_next = 1  # 已过期 → 巡检首轮就结算
     await p.store.save(w_g)
@@ -222,6 +235,7 @@ async def main():
     texts_all = [t[1] for t in ctx.send.sent if t[0] == "text"]
     check("警报触发通知", any("价格警报" in t for t in texts_all), str(texts_all[-2:]))
     check("资金费结算通知", any("资金费" in t for t in texts_all), str(texts_all[-2:]))
+    check("临近爆仓预警", any("临近爆仓" in t for t in texts_all), str(texts_all[-2:]))
     w_g2 = await p.store.get("s1")
     check("结算后 funding_next 推进", w_g2.funding_next > int(__import__("time").time()), str(w_g2.funding_next))
     check("多单付/收资金费记录", any("资金费" in t and "多" in t for t in texts_all), str(texts_all[-2:]))

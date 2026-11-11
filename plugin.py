@@ -32,7 +32,7 @@ from core.chart import curve_html, kline_html, kline_text, sparkline  # noqa: E4
 from core.market import MarketAggregator, Ticker24h, normalize_symbol  # noqa: E402
 from core.wallet import DCAPlan, FuturesPosition, PriceAlert, Trade, Wallet, WalletStore, now  # noqa: E402
 
-PLUGIN_VERSION = "0.3.0"
+PLUGIN_VERSION = "0.3.1"
 KLINE_INTERVALS = ("5m", "15m", "1h", "4h", "1d")
 FUNDING_INTERVAL = 8 * 3600  # 资金费结算周期：8 小时（UTC 0/8/16 点对齐）
 
@@ -88,6 +88,7 @@ class TaskConfig(PluginConfigBase):
     tick_seconds: int = Field(default=60, description="后台巡检间隔秒数（爆仓/止盈止损/警报/定投/快照）")
     snapshot_minutes: int = Field(default=30, description="资产快照间隔分钟")
     liquidation_alert: bool = Field(default=True, description="爆仓时是否主动发消息提醒")
+    liquidation_near_pct: float = Field(default=10.0, description="临近爆仓预警阈值（距爆仓价百分比，0=关闭；每仓 30 分钟最多提醒一次）")
     daily_report: bool = Field(default=True, description="每天定时发送收益报告")
     report_hour: int = Field(default=20, description="每日报告发送时间（24小时制，按宿主时区）")
     alert_targets: List[str] = Field(
@@ -184,6 +185,7 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
         self.market = MarketAggregator(price_ttl=cfg.market.price_cache_ttl)
         self._tick_task = None
         self._last_report_day = -1
+        self._liq_warn_ts: Dict[str, int] = {}   # 临近爆仓预警冷却：key -> 上次提醒时间戳
         self._sending = asyncio.Lock()
         self._tick_task = asyncio.create_task(self._background_loop())
 
@@ -262,7 +264,7 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
                         self.ctx.logger.info("钱包 %s 触发 %s", w.key, ev)
                         await self._notify(w, ev)
 
-                    # 3. 爆仓检查 + 通知
+                    # 3. 爆仓检查 + 通知 + 临近预警
                     if self.config.task.liquidation_alert:
                         hit = w.check_liquidation(prices)
                         for sp, mark in hit:
@@ -276,6 +278,25 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
                                 f"（价格{direct}爆仓价）\n"
                                 f"损失全部保证金 {sp.margin:,.2f} U 💀"
                             ))
+                        # 临近预警：距爆仓 < 阈值且未爆，每仓冷却 30 分钟
+                        near_pct = self.config.task.liquidation_near_pct
+                        if near_pct > 0:
+                            for sp in w.shorts.values():
+                                mark = prices.get(sp.symbol)
+                                if mark is None:
+                                    continue
+                                dist = abs(sp.liquidation_price / mark - 1) * 100
+                                key = f"{w.key}:{sp.symbol}:{sp.side}"
+                                if dist >= near_pct or now() - self._liq_warn_ts.get(key, 0) < 1800:
+                                    continue
+                                self._liq_warn_ts[key] = now()
+                                side_name = "空单" if sp.side == "short" else "多单"
+                                await self._notify(w, (
+                                    f"⚠️ 临近爆仓 {sp.symbol}\n"
+                                    f"{sp.leverage:g}x {side_name}距爆仓价仅 {dist:.1f}%"
+                                    f"（爆仓价 {fmt_price(sp.liquidation_price)}，现价 {fmt_price(mark)}）\n"
+                                    f"保证金 {sp.margin:,.2f} U，注意风险"
+                                ))
 
                     # 4. 价格警报（触发后删除并通知创建者所在流）
                     for aid in list(w.alerts.keys()):
@@ -469,6 +490,8 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
         if w.shorts:
             lines.append(f"📉 合约浮盈 {fmt_usdt(short_upnl)} U")
         lines.append(f"📈 已实现盈亏 {fmt_usdt(w.realized_pnl)} U　累计手续费 {w.fees_paid:,.2f} U")
+        if w.shorts or w.funding_total:
+            lines.append(f"💸 累计资金费 {fmt_usdt(-w.funding_total)} U（正=净收，负=净付）")
 
         if w.positions:
             lines.append("")
@@ -595,6 +618,8 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
             raise UserError("重置会清空钱包所有持仓与记录！确认请发：/coin reset 确认")
         if sub in ("market", "大盘"):
             return await self._cmd_market(stream_id)
+        if sub in ("funding", "资金费", "费率"):
+            return await self._cmd_funding(stream_id, rest)
         raise UserError(f"不认识的子命令「{parts[0]}」，/coin help 看用法")
 
     # ── 子命令实现 ──
@@ -604,7 +629,8 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
             "🪙 麦麦炒币模拟器（真实行情 · 模拟钱包）",
             "",
             "/coin                     资产总览",
-            "/coin price BTC           实时价格 + 24h涨跌",
+            "/coin price BTC [ETH...]  实时价格 + 24h涨跌（支持中文币名）",
+            "/coin funding [BTC]       当前资金费率（缺省=持仓币种）",
             "/coin buy BTC 100u        买入100U的BTC（或 /coin buy BTC 0.01 按数量）",
             "/coin sell BTC all        卖出（all=清仓，也可写数量）",
             "/coin short BTC 0.01 5x   开空单（默认杠杆见配置，0.01张×5倍）",
@@ -634,17 +660,44 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
 
     async def _cmd_price(self, stream_id: str, rest: List[str]) -> str:
         if not rest:
-            raise UserError("用法：/coin price <币种>  例：/coin price BTC")
-        sym = normalize_symbol(rest[0])
-        if not sym:
+            raise UserError("用法：/coin price <币种>[ <币种>...]  例：/coin price BTC ETH")
+        syms = [normalize_symbol(x) for x in rest if normalize_symbol(x)]
+        if not syms:
             raise UserError("币种不能为空")
-        t = await self.market.get_ticker24h(sym)
-        arrow = "🔴" if t.change_pct >= 0 else "🟢"
-        return (
-            f"{sym}/USDT  {fmt_price(t.price)} U\n"
-            f"{arrow} 24h {fmt_pct(t.change_pct)}　高 {fmt_price(t.high)}　低 {fmt_price(t.low)}\n"
-            f"📡 来源 {t.source}"
-        )
+        syms = list(dict.fromkeys(syms))[:6]  # 去重限 6 个
+        if len(syms) == 1:
+            t = await self.market.get_ticker24h(syms[0])
+            arrow = "🔴" if t.change_pct >= 0 else "🟢"
+            return (
+                f"{syms[0]}/USDT  {fmt_price(t.price)} U\n"
+                f"{arrow} 24h {fmt_pct(t.change_pct)}　高 {fmt_price(t.high)}　低 {fmt_price(t.low)}\n"
+                f"📡 来源 {t.source}"
+            )
+        tickers = await self.market.get_overview(syms)
+        lines = []
+        for sym, t in tickers:
+            arrow = "🔴" if t.change_pct >= 0 else "🟢"
+            lines.append(f"{sym}  {fmt_price(t.price)} U　{arrow} {fmt_pct(t.change_pct)}")
+        return "\n".join(lines)
+
+    async def _cmd_funding(self, stream_id: str, rest: List[str]) -> str:
+        """当前资金费率：/coin funding [币种]（默认列出持仓/空单币种）"""
+        if rest:
+            syms = [normalize_symbol(rest[0])]
+        else:
+            w = await self.store.get(stream_id)
+            syms = sorted({sp.symbol for sp in w.shorts.values()})
+            if not syms:
+                raise UserError("没有合约仓位。用法：/coin funding <币种>  例：/coin funding BTC")
+        lines = []
+        for sym in syms:
+            rate = await self.market.get_funding(sym)
+            if rate is None:
+                lines.append(f"{sym}  资金费率暂不可得")
+                continue
+            direction = "多头付 → 空头收" if rate >= 0 else "空头付 → 多头收"
+            lines.append(f"{sym}  资金费率 {rate * 100:+.4f}%（{direction}）")
+        return "\n".join(lines)
 
     async def _cmd_buy(self, stream_id: str, rest: List[str]) -> str:
         if len(rest) < 2:

@@ -252,10 +252,16 @@ ev = wF.settle_funding({"BTC": 0.0001, "ETH": 0.0001})  # 正费率：多付 0.0
 check("正费率：多付空收", approx(wF.cash, cash0 - 0.01 + 0.01))
 check("多单累计付费", approx(wF.shorts["BTC|L"].funding_paid, 0.01))
 check("空单累计收费", approx(wF.shorts["ETH|S"].funding_paid, -0.01))
+check("钱包级资金费净额=0", approx(wF.funding_total, 0.0))
 check("结算事件2条", len(ev) == 2)
 ev = wF.settle_funding({"BTC": -0.0002})              # 负费率：多收 0.02
 check("负费率：多单收取", approx(wF.cash, cash0 + 0.02))
+check("钱包级资金费净额=-0.02（净收）", approx(wF.funding_total, -0.02))
 check("缺费率币种跳过", wF.settle_funding({}) == [])
+# funding_total round-trip
+dF = json.loads(json.dumps(wF.to_dict()))
+wFr = Wallet.from_dict(dF)
+check("funding_total round-trip", approx(wFr.funding_total, wF.funding_total))
 # 异常费率截断（±5%）
 wF.settle_funding({"BTC": 0.5})
 check("异常费率截断", approx(wF.shorts["BTC|L"].funding_paid, 0.01 - 0.02 + 100 * 0.05))
