@@ -27,6 +27,14 @@ def now() -> int:
     return int(time.time())
 
 
+def fmt_qty_local(v: float) -> str:
+    if v >= 1000:
+        return f"{v:,.2f}"
+    if v >= 1:
+        return f"{v:,.6f}".rstrip("0").rstrip(".")
+    return f"{v:.8f}".rstrip("0").rstrip(".")
+
+
 def fnum(x: float) -> float:
     """清洗浮点：-0.0 → 0.0，极小值归零。"""
     return 0.0 if abs(x) < EPS else x
@@ -61,10 +69,27 @@ class ShortPosition:
     liquidation_price: float
     opened_at: int = field(default_factory=now)
     note: str = ""
+    tp_price: float = 0.0    # 止盈价（<=0 = 未设）；标记价 <= tp 触发平空
+    sl_price: float = 0.0    # 止损价（<=0 = 未设）；标记价 >= sl 触发平空
 
     def unrealized(self, mark: float) -> float:
         """按标记价计算浮盈（正=赚）。"""
         return fnum((self.entry_price - mark) * self.qty)
+
+
+@dataclass
+class PriceAlert:
+    """到价警报：mark 触发 op 条件后提醒并删除。"""
+    symbol: str
+    op: str                   # ">=" 或 "<="
+    price: float
+    stream_id: str = ""       # 创建时的聊天流（通知发回这里）
+    note: str = ""
+    created_at: int = field(default_factory=now)
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:6])
+
+    def triggered(self, mark: float) -> bool:
+        return mark >= self.price if self.op == ">=" else mark <= self.price
 
 
 @dataclass
@@ -90,11 +115,12 @@ class Wallet:
         self.initial_cash = initial_cash
         self.cash = initial_cash
         self.created_at = created_at or now()
-        # positions: {symbol: {"qty": float, "avg_cost": float}}
+        # positions: {symbol: {"qty": float, "avg_cost": float, "tp_price": float, "sl_price": float}}
         self.positions: Dict[str, Dict[str, float]] = {}
         self.shorts: Dict[str, ShortPosition] = {}
         self.trades: List[Trade] = []
         self.plans: Dict[str, DCAPlan] = {}
+        self.alerts: Dict[str, PriceAlert] = {}
         self.realized_pnl = 0.0
         self.fees_paid = 0.0
         self.snapshots: List[List[float]] = []   # [ts, total_value]
@@ -209,6 +235,70 @@ class Wallet:
                 hit.append((sp, mark))
         return hit
 
+    def check_tp_sl(self, prices: Dict[str, float]) -> List[str]:
+        """检查止盈止损，直接执行平仓。返回人类可读的成交描述列表。
+
+        现货：tp 在上方（mark >= tp 全卖）、sl 在下方（mark <= sl 全卖）
+        空单：tp 在下方（mark <= tp 平空）、sl 在上方（mark >= sl 平空）
+        """
+        events: List[str] = []
+        # 现货
+        for sym in list(self.positions.keys()):
+            pos = self.positions[sym]
+            mark = prices.get(sym)
+            if mark is None:
+                continue
+            hit_kind = ""
+            if pos.get("tp_price", 0) > 0 and mark >= pos["tp_price"]:
+                hit_kind = "止盈"
+            elif pos.get("sl_price", 0) > 0 and mark <= pos["sl_price"]:
+                hit_kind = "止损"
+            if not hit_kind:
+                continue
+            qty, avg = pos["qty"], pos["avg_cost"]
+            pnl = fnum((mark - avg) * qty)
+            self.sell(sym, None, mark, 0.0, note=f"auto:{hit_kind}")
+            events.append(f"🎯 现货{hit_kind}：{sym} {fmt_qty_local(qty)} @ {mark:,.6g}（盈亏 {pnl:+,.2f} U）")
+        # 空单
+        for sym in list(self.shorts.keys()):
+            sp = self.shorts[sym]
+            mark = prices.get(sym)
+            if mark is None:
+                continue
+            hit_kind = ""
+            if sp.tp_price > 0 and mark <= sp.tp_price:
+                hit_kind = "止盈"
+            elif sp.sl_price > 0 and mark >= sp.sl_price:
+                hit_kind = "止损"
+            if not hit_kind:
+                continue
+            t = self.close_short(sym, None, mark, 0.0, note=f"auto:{hit_kind}")
+            events.append(f"🎯 空单{hit_kind}：{sym} {fmt_qty_local(sp.qty)} @ {mark:,.6g}（盈亏 {t.pnl:+,.2f} U）")
+        return events
+
+    def set_tp_sl(self, symbol: str, tp: float = 0.0, sl: float = 0.0, side: str = "auto") -> str:
+        """给现货或空单设置止盈/止损价（0=清除）。side: auto/spot/short。返回操作描述。"""
+        has_pos = symbol in self.positions
+        has_short = symbol in self.shorts
+        if side == "auto":
+            if has_pos and has_short:
+                return "AMBIVALENT"  # 同时持有时需明确 side
+            side = "spot" if has_pos else "short" if has_short else ""
+        if side == "spot":
+            if not has_pos:
+                raise ValueError(f"没有 {symbol} 现货持仓")
+            pos = self.positions[symbol]
+            pos["tp_price"] = tp
+            pos["sl_price"] = sl
+            return "spot"
+        if side == "short":
+            if not has_short:
+                raise ValueError(f"没有 {symbol} 空单")
+            self.shorts[symbol].tp_price = tp
+            self.shorts[symbol].sl_price = sl
+            return "short"
+        raise ValueError(f"没有 {symbol} 的持仓/空单")
+
     # ── 定投 ──
 
     def due_plans(self, t: Optional[int] = None) -> List[DCAPlan]:
@@ -278,6 +368,7 @@ class Wallet:
             "shorts": {k: vars(sp) for k, sp in self.shorts.items()},
             "trades": [t.to_dict() for t in self.trades],
             "plans": {k: vars(p) for k, p in self.plans.items()},
+            "alerts": {k: vars(a) for k, a in self.alerts.items()},
             "realized_pnl": self.realized_pnl,
             "fees_paid": self.fees_paid,
             "snapshots": self.snapshots,
@@ -288,13 +379,22 @@ class Wallet:
     def from_dict(cls, d: Dict[str, Any]) -> "Wallet":
         w = cls(d["key"], float(d["initial_cash"]), d.get("created_at"))
         w.cash = float(d.get("cash", d["initial_cash"]))
-        w.positions = {k: {"qty": float(v["qty"]), "avg_cost": float(v["avg_cost"])} for k, v in d.get("positions", {}).items()}
+        w.positions = {
+            k: {
+                "qty": float(v["qty"]),
+                "avg_cost": float(v["avg_cost"]),
+                "tp_price": float(v.get("tp_price", 0) or 0),
+                "sl_price": float(v.get("sl_price", 0) or 0),
+            } for k, v in d.get("positions", {}).items()
+        }
         w.shorts = {
             k: ShortPosition(
                 symbol=v["symbol"], qty=float(v["qty"]), entry_price=float(v["entry_price"]),
                 leverage=float(v["leverage"]), margin=float(v["margin"]),
                 liquidation_price=float(v["liquidation_price"]), opened_at=int(v.get("opened_at", 0)),
                 note=v.get("note", ""),
+                tp_price=float(v.get("tp_price", 0) or 0),
+                sl_price=float(v.get("sl_price", 0) or 0),
             ) for k, v in d.get("shorts", {}).items()
         }
         w.trades = [
@@ -311,6 +411,13 @@ class Wallet:
                 enabled=bool(p.get("enabled", True)), id=k, last_run=int(p.get("last_run", 0)),
                 last_status=p.get("last_status", ""),
             ) for k, p in d.get("plans", {}).items()
+        }
+        w.alerts = {
+            k: PriceAlert(
+                symbol=a["symbol"], op=a.get("op", ">="), price=float(a["price"]),
+                stream_id=a.get("stream_id", ""), note=a.get("note", ""),
+                created_at=int(a.get("created_at", 0)), id=k,
+            ) for k, a in d.get("alerts", {}).items()
         }
         w.realized_pnl = float(d.get("realized_pnl", 0.0))
         w.fees_paid = float(d.get("fees_paid", 0.0))

@@ -30,9 +30,9 @@ from typing import List  # noqa: E402
 
 from core.chart import curve_html, kline_html, kline_text, sparkline  # noqa: E402
 from core.market import MarketAggregator, Ticker24h, normalize_symbol  # noqa: E402
-from core.wallet import DCAPlan, ShortPosition, Trade, Wallet, WalletStore, now  # noqa: E402
+from core.wallet import DCAPlan, PriceAlert, ShortPosition, Trade, Wallet, WalletStore, now  # noqa: E402
 
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "0.2.0"
 KLINE_INTERVALS = ("5m", "15m", "1h", "4h", "1d")
 
 
@@ -75,9 +75,11 @@ class ChartConfig(PluginConfigBase):
 class TaskConfig(PluginConfigBase):
     """后台任务"""
     __ui_label__ = "后台任务"
-    tick_seconds: int = Field(default=60, description="后台巡检间隔秒数（爆仓检查/定投/快照）")
+    tick_seconds: int = Field(default=60, description="后台巡检间隔秒数（爆仓/止盈止损/警报/定投/快照）")
     snapshot_minutes: int = Field(default=30, description="资产快照间隔分钟")
     liquidation_alert: bool = Field(default=True, description="爆仓时是否主动发消息提醒")
+    daily_report: bool = Field(default=True, description="每天定时发送收益报告")
+    report_hour: int = Field(default=20, description="每日报告发送时间（24小时制，按宿主时区）")
     alert_targets: List[str] = Field(
         default_factory=list,
         description=(
@@ -170,9 +172,10 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
         data_dir = Path(self.ctx.paths.data_dir)
         self.store = WalletStore(data_dir, cfg.main.initial_cash, cfg.main.wallet_mode)
         self.market = MarketAggregator(price_ttl=cfg.market.price_cache_ttl)
-        self._save_task = None
         self._tick_task = None
+        self._last_report_day = -1
         self._sending = asyncio.Lock()
+        self._tick_task = asyncio.create_task(self._background_loop())
 
         # 启动测速（不阻塞加载太久，失败也能跑：get_price 时会逐源尝试）
         try:
@@ -211,23 +214,31 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
         remeasure_sec = max(300, int(self.config.market.remeasure_hours * 3600))
         while True:
             try:
-                await asyncio.sleep(max(10, self.config.task.tick_seconds))
+                await asyncio.sleep(max(1, self.config.task.tick_seconds))
                 wallets = await self.store.get_all()
-                # 1. 汇总需要查价的币种
+                # 1. 汇总需要查价的币种（持仓/空单/定投/警报）
                 symbols: set = set()
                 for w in wallets:
                     symbols.update(w.positions.keys())
                     symbols.update(w.shorts.keys())
                     symbols.update(p.symbol for p in w.plans.values())
-                if not symbols and not any(w.plans for w in wallets):
-                    continue
+                    symbols.update(a.symbol for a in w.alerts.values())
                 prices = await self.market.get_prices(sorted(symbols)) if symbols else {}
 
-                # 2. 爆仓检查 + 通知
-                if self.config.task.liquidation_alert:
-                    for w in wallets:
+                for w in wallets:
+                    changed = False
+                    # 2. 止盈止损（自动平仓）
+                    events = w.check_tp_sl(prices)
+                    for ev in events:
+                        changed = True
+                        self.ctx.logger.info("钱包 %s 触发 %s", w.key, ev)
+                        await self._notify(w, ev)
+
+                    # 3. 爆仓检查 + 通知
+                    if self.config.task.liquidation_alert:
                         hit = w.check_liquidation(prices)
                         for sp, mark in hit:
+                            changed = True
                             self.ctx.logger.warning("钱包 %s 爆仓: %s %.6g张 @%.6g", w.key, sp.symbol, sp.qty, mark)
                             await self._notify(w, (
                                 f"⚠️ 爆仓警报 {sp.symbol}\n"
@@ -235,9 +246,22 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
                                 f"损失全部保证金 {sp.margin:,.2f} U 💀"
                             ))
 
-                # 3. 定投到期执行
-                for w in wallets:
+                    # 4. 价格警报（触发后删除并通知创建者所在流）
+                    for aid in list(w.alerts.keys()):
+                        a = w.alerts[aid]
+                        mark = prices.get(a.symbol)
+                        if mark is not None and a.triggered(mark):
+                            del w.alerts[aid]
+                            changed = True
+                            arrow = "📈" if a.op == ">=" else "📉"
+                            await self._notify_stream(a.stream_id, w, (
+                                f"🔔 价格警报 {a.symbol}\n"
+                                f"{arrow} 已{'上穿' if a.op == '>=' else '下破'} {fmt_price(a.price)}（现价 {fmt_price(mark)}）"
+                            ))
+
+                    # 5. 定投到期执行
                     for plan in w.due_plans():
+                        changed = True
                         price = prices.get(plan.symbol)
                         if price is None:
                             w.advance_plan(plan, "无行情")
@@ -250,16 +274,19 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
                         except Exception as e:  # noqa: BLE001
                             w.advance_plan(plan, f"异常: {e}")
 
-                # 4. 资产快照（含定投改动的钱包都要存）
-                snap_gap = max(60, self.config.task.snapshot_minutes * 60)
-                for w in wallets:
-                    need_snap = w.snapshots and now() - int(w.snapshots[-1][0]) >= snap_gap
-                    if not w.snapshots or need_snap:
-                        w.snapshot(prices, force=False)
+                    # 6. 资产快照
+                    snap_gap = max(60, self.config.task.snapshot_minutes * 60)
+                    if (not w.snapshots) or (now() - int(w.snapshots[-1][0]) >= snap_gap):
+                        if w.snapshot(prices, force=False):
+                            changed = True
 
                 await self.store.save_all()
 
-                # 5. 定期重测速
+                # 7. 每日报告
+                if self.config.task.daily_report:
+                    await self._maybe_daily_report(wallets, prices)
+
+                # 8. 定期重测速
                 if now() - last_measure >= remeasure_sec:
                     last_measure = now()
                     asyncio.create_task(self._safe_measure())
@@ -267,6 +294,28 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
                 raise
             except Exception as e:  # noqa: BLE001
                 self.ctx.logger.error("后台巡检异常: %s", e)
+
+    async def _notify_stream(self, stream_id: str, w: Wallet, text: str) -> None:
+        """发到指定流；流不可用则回退常规通知路径。"""
+        if stream_id and await self._try_send(text, stream_id):
+            return
+        await self._notify(w, text)
+
+    async def _maybe_daily_report(self, wallets: List[Wallet], prices: Dict[str, float]) -> None:
+        """每天 report_hour 点发一次收益报告（跨天只发一次）。"""
+        import datetime
+        today = datetime.datetime.now()
+        if today.hour < max(0, min(23, self.config.task.report_hour)):
+            return
+        day = today.date().toordinal()
+        if day == self._last_report_day:
+            return
+        self._last_report_day = day
+        for w in wallets:
+            if not w.trades and not w.positions and not w.shorts:
+                continue  # 从未交易过的钱包不发
+            lines, _ = await self._portfolio_lines(w, day_scope=True)
+            await self._notify(w, "\n".join(lines))
 
     async def _safe_measure(self) -> None:
         try:
@@ -370,8 +419,8 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
 
     # ── 业务视图 ──
 
-    async def _portfolio_lines(self, w: Wallet) -> Tuple[List[str], Dict[str, float]]:
-        """生成资产总览文本行与持仓价格表。"""
+    async def _portfolio_lines(self, w: Wallet, day_scope: bool = False) -> Tuple[List[str], Dict[str, float]]:
+        """生成资产总览文本行与持仓价格表。day_scope=True 额外算今日盈亏。"""
         cfg = self.config
         symbols = sorted(set(w.positions) | set(w.shorts))
         prices = await self.market.get_prices(symbols) if symbols else {}
@@ -402,9 +451,14 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
                 val = pos["qty"] * p
                 upnl = (p - pos["avg_cost"]) * pos["qty"]
                 pct = (p / pos["avg_cost"] - 1) * 100 if pos["avg_cost"] else 0.0
+                tpsl = ""
+                if pos.get("tp_price", 0) > 0:
+                    tpsl += f"　TP {fmt_price(pos['tp_price'])}"
+                if pos.get("sl_price", 0) > 0:
+                    tpsl += f"　SL {fmt_price(pos['sl_price'])}"
                 lines.append(
                     f"· {sym} × {fmt_qty(pos['qty'])} @ {fmt_price(pos['avg_cost'])} → {fmt_price(p)}"
-                    f"　值 {val:,.2f} U　{fmt_usdt(upnl)} U（{fmt_pct(pct)}）"
+                    f"　值 {val:,.2f} U　{fmt_usdt(upnl)} U（{fmt_pct(pct)}）{tpsl}"
                 )
         if w.shorts:
             lines.append("")
@@ -417,9 +471,14 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
                 upnl = sp.unrealized(p)
                 pct = upnl / sp.margin * 100 if sp.margin else 0.0
                 dist = (sp.liquidation_price / p - 1) * 100 if p else 0.0
+                tpsl = ""
+                if sp.tp_price > 0:
+                    tpsl += f"　TP {fmt_price(sp.tp_price)}"
+                if sp.sl_price > 0:
+                    tpsl += f"　SL {fmt_price(sp.sl_price)}"
                 lines.append(
                     f"· {sym} 空 {fmt_qty(sp.qty)} @ {fmt_price(sp.entry_price)} {sp.leverage:.0f}x → {fmt_price(p)}"
-                    f"　浮盈 {fmt_usdt(upnl)} U（{fmt_pct(pct)}）　距爆仓 {dist:.1f}%"
+                    f"　浮盈 {fmt_usdt(upnl)} U（{fmt_pct(pct)}）　距爆仓 {dist:.1f}%{tpsl}"
                 )
         if w.plans:
             lines.append("")
@@ -486,8 +545,16 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
             return await self._cmd_dca(stream_id, rest)
         if sub in ("source", "sources", "源", "交易所", "测速"):
             return await self._cmd_source(stream_id)
-        if sub in ("alert", "通知", "通知目标"):
-            return await self._cmd_alert(stream_id)
+        if sub in ("notify", "通知", "通知目标"):
+            return await self._cmd_notify(stream_id)
+        if sub in ("alert", "警报", "提醒", "价格警报"):
+            return await self._cmd_price_alert(stream_id, rest)
+        if sub in ("tp", "止盈"):
+            return await self._cmd_tp_sl(stream_id, rest, "tp")
+        if sub in ("sl", "止损"):
+            return await self._cmd_tp_sl(stream_id, rest, "sl")
+        if sub in ("rank", "排行", "排行榜"):
+            return await self._cmd_rank(stream_id)
         if sub in ("reset", "重置"):
             if len(parts) >= 2 and parts[1] in ("确认", "yes", "ok"):
                 return await self._cmd_reset_confirm(stream_id)
@@ -513,9 +580,12 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
             "/coin kline BTC [1h] [96] K线图",
             "/coin curve               资产曲线",
             "/coin dca add BTC 100u 6h 添加定投（list/del <id>/pause <id>/resume <id>）",
+            "/coin alert add BTC >= 100000 价格警报（list/del）",
+            "/coin tp BTC 110000       设止盈（sl 止损同理，clear 清除）",
+            "/coin rank                钱包排行榜（chat 模式）",
             "/coin market              大盘概览",
             "/coin source              行情源测速",
-            "/coin alert               查看/检测爆仓通知目标",
+            "/coin notify              查看/检测主动通知目标",
             "/coin reset               重置钱包（需管理员）",
             "",
             "💡 也可以直接喊麦麦：帮我看下BTC多少钱 / 麦麦全仓梭哈ETH（AI自主调用工具）",
@@ -746,7 +816,7 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
         lines.append("取价顺序按测速结果自动降级，无需手动切换")
         return "\n".join(lines)
 
-    async def _cmd_alert(self, stream_id: str) -> str:
+    async def _cmd_notify(self, stream_id: str) -> str:
         """查看通知目标配置 + 实测解析是否成功。"""
         targets: List[str] = list(getattr(self.config.task, "alert_targets", []) or [])
         lines = ["🔔 主动通知（爆仓/定投异常）目标"]
@@ -762,6 +832,116 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
             lines.append(f"· {t}（{kind}）{mark}")
         lines.append("")
         lines.append("✅=解析成功可送达；❌=麦麦不认识这个群/好友（需先在目标群/私聊里说过话）")
+        return "\n".join(lines)
+
+    async def _cmd_price_alert(self, stream_id: str, rest: List[str]) -> str:
+        """价格警报：/coin alert add BTC >= 100000 | list | del <id>"""
+        w = await self.store.get(stream_id)
+        if not rest or rest[0].lower() in ("list", "列表"):
+            if not w.alerts:
+                return "📭 没有价格警报\n用法：/coin alert add <币种> >= 目标价（或 <=）"
+            lines = ["🔔 价格警报"]
+            for a in sorted(w.alerts.values(), key=lambda x: x.created_at):
+                arrow = "📈 上穿" if a.op == ">=" else "📉 下破"
+                lines.append(f"· [{a.id}] {a.symbol} {arrow} {fmt_price(a.price)}（{fmt_ago(a.created_at)}设）")
+            return "\n".join(lines)
+        op = rest[0].lower()
+        if op in ("add", "添加"):
+            if len(rest) < 4:
+                raise UserError("用法：/coin alert add <币种> <>=|<=|上穿|下破> <目标价>")
+            sym = normalize_symbol(rest[1])
+            op_map = {">=": ">=", ">": ">=", "上穿": ">=", "突破": ">=", "<=": "<=", "<": "<=", "下破": "<=", "跌破": "<="}
+            cmp_op = op_map.get(rest[2])
+            if not cmp_op:
+                raise UserError("条件写 >= 或 <=（也认：上穿/突破/下破/跌破）")
+            try:
+                target = float(rest[3].replace(",", ""))
+            except ValueError:
+                raise UserError(f"目标价无效：{rest[3]}")
+            if target <= 0:
+                raise UserError("目标价要大于 0")
+            price, _ = await self.market.get_price(sym)  # 顺带校验币种
+            a = PriceAlert(symbol=sym, op=cmp_op, price=target, stream_id=stream_id)
+            w.alerts[a.id] = a
+            await self.store.save(w)
+            arrow = "📈 上穿" if cmp_op == ">=" else "📉 下破"
+            return f"✅ 警报已设 [{a.id}]：{sym} {arrow} {fmt_price(target)}（现价 {fmt_price(price)}）"
+        if op in ("del", "rm", "删除"):
+            if len(rest) < 2 or rest[1] not in w.alerts:
+                raise UserError("要删除的警报 id 不存在，/coin alert 看看")
+            a = w.alerts.pop(rest[1])
+            await self.store.save(w)
+            return f"🗑 已删除警报 [{a.id}] {a.symbol}"
+        raise UserError(f"不认识的警报操作「{rest[0]}」：add / list / del")
+
+    async def _cmd_tp_sl(self, stream_id: str, rest: List[str], kind: str) -> str:
+        """止盈止损：/coin tp BTC 110000 | clear。现货与空单方向自动适配。"""
+        kind_name = "止盈" if kind == "tp" else "止损"
+        if not rest:
+            raise UserError(f"用法：/coin {kind} <币种> <价格|clear> [spot|short]")
+        sym = normalize_symbol(rest[0])
+        w = await self.store.get(stream_id)
+        has_pos, has_short = sym in w.positions, sym in w.shorts
+        if not has_pos and not has_short:
+            raise UserError(f"没有 {sym} 的持仓/空单，先开仓再设{kind_name}")
+        side = "auto"
+        if rest[-1].lower() in ("spot", "short"):
+            side = rest[-1].lower()
+            rest = rest[:-1]
+        if len(rest) < 2:
+            raise UserError(f"用法：/coin {kind} {sym} <价格|clear>" + (" [spot|short]" if has_pos and has_short else ""))
+        raw = rest[1].lower()
+        hint = ""
+        if raw in ("clear", "清除", "取消"):
+            price_val = 0.0
+        else:
+            try:
+                price_val = float(raw.replace(",", ""))
+            except ValueError:
+                raise UserError(f"价格无效：{raw}")
+            if price_val <= 0:
+                raise UserError("价格要大于 0")
+            # 方向合理性提示（按当前持仓类型），只提示不阻止
+            cur, _ = await self.market.get_price(sym)
+            if has_pos and side != "short":
+                expect = cur < price_val if kind == "tp" else cur > price_val
+            else:
+                expect = cur > price_val if kind == "tp" else cur < price_val
+            if not expect:
+                hint = f"\n💡 注意：按当前价 {fmt_price(cur)}，这个{kind_name}价可能立即触发"
+        try:
+            applied = w.set_tp_sl(sym, tp=price_val if kind == "tp" else 0.0, sl=price_val if kind == "sl" else 0.0, side=side)
+        except ValueError as e:
+            raise UserError(str(e))
+        if applied == "AMBIVALENT":
+            raise UserError(f"{sym} 同时有现货和空单，请明确写 /coin {kind} {sym} <价格> spot 或 short")
+        await self.store.save(w)
+        side_name = "现货" if applied == "spot" else "空单"
+        if price_val == 0.0:
+            return f"🗑 已清除 {sym} {side_name}的{kind_name}"
+        return f"✅ {sym} {side_name}{kind_name}已设：{fmt_price(price_val)}{hint}"
+
+    async def _cmd_rank(self, stream_id: str) -> str:
+        """排行榜（chat 模式：各钱包总资产排名）。"""
+        if self.store.mode != "chat":
+            raise UserError("排行榜只在 chat 钱包模式下有意义（当前是 global 全局单钱包）")
+        wallets = await self.store.get_all()
+        if not wallets:
+            raise UserError("还没有任何钱包")
+        symbols: set = set()
+        for w in wallets:
+            symbols.update(w.positions.keys())
+            symbols.update(w.shorts.keys())
+        prices = await self.market.get_prices(sorted(symbols)) if symbols else {}
+        rows = []
+        for w in wallets:
+            rows.append((w.total_value(prices), w))
+        rows.sort(key=lambda x: x[0], reverse=True)
+        medal = {0: "🥇", 1: "🥈", 2: "🥉"}
+        lines = ["🏆 钱包排行榜（总资产）"]
+        for i, (v, w) in enumerate(rows[:10]):
+            key = w.key[:18] + "…" if len(w.key) > 18 else w.key
+            lines.append(f"{medal.get(i, f'{i+1}.')} {key}　{v:,.2f} U（{fmt_pct((v / w.initial_cash - 1) * 100)}）")
         return "\n".join(lines)
 
     async def _cmd_market(self, stream_id: str) -> str:
@@ -853,6 +1033,27 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
             return False, str(e), 1
         except Exception as e:  # noqa: BLE001
             return False, f"下单失败：{type(e).__name__}: {e}", 1
+
+    @Tool(
+        name="crypto_set_alert",
+        description="设置价格警报：当某币种上穿/下破目标价时麦麦会收到提醒并转告大家。当有人说「BTC涨到10万提醒我」「到XX价喊我」时调用。",
+        parameters=[
+            ToolParameterInfo(name="symbol", param_type=ToolParamType.STRING, description="币种符号，如 BTC", required=True),
+            ToolParameterInfo(name="op", param_type=ToolParamType.STRING, description="上穿（>=）或下破（<=）", required=True),
+            ToolParameterInfo(name="price", param_type=ToolParamType.STRING, description="目标价", required=True),
+            ToolParameterInfo(name="stream_id", param_type=ToolParamType.STRING, description="当前聊天流ID", required=False),
+        ],
+    )
+    async def tool_set_alert(self, symbol: str, op: str, price: str, stream_id: str = "", **kwargs):
+        try:
+            op_map = {">=": ">=", ">": ">=", "上穿": ">=", "突破": ">=", "<=": "<=", "<": "<=", "下破": "<=", "跌破": "<="}
+            cmp_op = op_map.get(op.strip())
+            if not cmp_op:
+                return False, f"op 要写 >= 或 <=（也认：上穿/突破/下破/跌破）", 1
+            args = ["add", symbol, cmp_op, price]
+            return True, await self._cmd_price_alert(stream_id, args), 2
+        except Exception as e:  # noqa: BLE001
+            return False, f"设置警报失败：{e}", 1
 
     @Tool(
         name="crypto_market_overview",

@@ -111,9 +111,9 @@ async def main():
     cmds = [i for i in infos if i.get("type") == "COMMAND"]
     tools = [i for i in infos if i.get("type") == "TOOL"]
     check("注册 1 个 Command", len(cmds) == 1 and cmds[0]["name"] == "coin", str([i.get("name") for i in infos]))
-    check("注册 4 个 Tool", len(tools) == 4, str([i.get("name") for i in infos]))
+    check("注册 5 个 Tool", len(tools) == 5, str([i.get("name") for i in infos]))
     tool_names = {i["name"] for i in tools}
-    check("Tool 名称齐全", {"crypto_get_price", "crypto_get_portfolio", "crypto_trade", "crypto_market_overview"} <= tool_names)
+    check("Tool 名称齐全", {"crypto_get_price", "crypto_get_portfolio", "crypto_trade", "crypto_set_alert", "crypto_market_overview"} <= tool_names)
     if cmds:
         import re as _re
         pat = _re.compile(cmds[0].get("metadata", {}).get("command_pattern") or "")
@@ -175,6 +175,66 @@ async def main():
     ok, msg, _ = await run_cmd("reset 确认")
     check("reset 确认执行", ok and "重置" in msg)
 
+    print("[新功能命令]")
+    ok, msg, _ = await run_cmd("alert add BTC >= 99999999")
+    check("添加价格警报", ok and "警报已设" in msg, msg)
+    ok, msg, _ = await run_cmd("alert")
+    check("警报列表", ok and "99,999,999" in msg, msg)
+    aid = msg.split("[")[1].split("]")[0] if "[" in msg else ""
+    ok, msg, _ = await run_cmd(f"alert del {aid}")
+    check("删除警报", ok and "已删除" in msg, msg)
+    ok, msg, _ = await run_cmd("alert add BTC 瞎写 123")
+    check("警报非法条件报错", not ok and ">=" in msg, msg)
+
+    # 警报触发路径：设一个立刻会触发的（低价的 >=），跑一轮巡检
+    ok, msg, _ = await run_cmd("alert add BTC >= 1")
+    check("添加必触发警报", ok)
+    p._tick_task.cancel()
+    try:
+        await p._tick_task
+    except asyncio.CancelledError:
+        pass
+    p.config.task.tick_seconds = 1   # 先改间隔再起任务（loop 首轮 sleep 读的就是它）
+    tick_fast = asyncio.create_task(p._background_loop())
+    await asyncio.sleep(2.5)
+    texts_all = [t[1] for t in ctx.send.sent if t[0] == "text"]
+    check("警报触发通知", any("价格警报" in t for t in texts_all), str(texts_all[-2:]))
+    tick_fast.cancel()
+    try:
+        await tick_fast
+    except asyncio.CancelledError:
+        pass
+    p.config.task.tick_seconds = 60
+    p._tick_task = asyncio.create_task(p._background_loop())
+
+    ok, msg, _ = await run_cmd("buy ETH 500u")
+    check("买入 ETH（备设 tp）", ok)
+    import re as _re2
+    cur_eth = float(_re2.search(r"@ ([\d,]+\.?\d*)", msg).group(1).replace(",", ""))  # 「@ 现价」处抓价格
+    ok, msg, _ = await run_cmd(f"tp ETH {cur_eth * 2:.0f}")
+    check("设止盈", ok and "止盈已设" in msg, msg)
+    ok, msg, _ = await run_cmd("pos")
+    check("持仓显示 TP", ok and "TP" in msg, msg)
+    ok, msg, _ = await run_cmd("tp ETH clear")
+    check("清除止盈", ok and "清除" in msg, msg)
+    ok, msg, _ = await run_cmd("sl ETH 0.0000001")
+    check("设必触止损（带提示）", ok and "止损已设" in msg, msg)
+    ok, msg, _ = await run_cmd("tp DOGE 123")
+    check("无持仓设tp报错", not ok and "没有" in msg, msg)
+
+    ok, msg, _ = await run_cmd("rank")
+    check("global 模式 rank 拒绝", not ok and "chat" in msg, msg)
+    p.store.mode = "chat"
+    ok, msg, _ = await run_cmd("rank")
+    check("chat 模式 rank", ok and ("🥇" in msg or "U" in msg), msg)
+    p.store.mode = "global"
+
+    ok, msg, _ = await run_cmd("notify")
+    
+
+    ok, msg, _ = await p.tool_set_alert(symbol="BTC", op="上穿", price="88888888", stream_id="s1")
+    check("tool 设警报", ok and "警报已设" in msg, msg)
+
     ok, msg, _ = await run_cmd("buy BTC abc")
     check("非法参数报错", not ok)
 
@@ -229,13 +289,13 @@ async def main():
     texts = [t[1] for t in ctx.send.sent if t[0] == "text"]
     check("未配置回退最近活跃流", len(texts) == 1 and "回退通知" in texts[0], str(texts))
 
-    ok, msg, _ = await run_cmd("alert")
-    check("alert 命令（无目标）", ok and "未配置" in msg, msg)
+    ok, msg, _ = await run_cmd("notify")
+    check("notify 命令（无目标）", ok and "未配置" in msg, msg)
 
-    # 恢复目标配置再测 alert 命令
+    # 恢复目标配置再测 notify 命令
     p.config.task.alert_targets = ["123456", "000000"]
-    ok, msg, _ = await run_cmd("alert")
-    check("alert 命令（有目标）", ok and "123456" in msg and "✅" in msg, msg)
+    ok, msg, _ = await run_cmd("notify")
+    check("notify 命令（有目标）", ok and "123456" in msg and "✅" in msg, msg)
 
     print("[生命周期收尾]")
     await p.on_unload()

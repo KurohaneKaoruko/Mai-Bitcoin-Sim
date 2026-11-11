@@ -15,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.market import Candle, MarketAggregator, normalize_symbol  # noqa: E402
-from core.wallet import DCAPlan, ShortPosition, Trade, Wallet, WalletStore, now  # noqa: E402
+from core.wallet import DCAPlan, PriceAlert, ShortPosition, Trade, Wallet, WalletStore, now  # noqa: E402
 from core.chart import curve_html, kline_html, kline_text, sparkline  # noqa: E402
 
 PASS, FAIL = 0, 0
@@ -152,6 +152,81 @@ async def test_store():
 
 
 asyncio.run(test_store())
+
+# ─── 止盈止损 ───
+print("[止盈止损]")
+w6 = Wallet("t6", 10000.0)
+w6.buy("BTC", 5000, 100.0, 0.0)                     # 50 个 @100
+w6.positions["BTC"]["tp_price"] = 110.0
+w6.positions["BTC"]["sl_price"] = 90.0
+ev = w6.check_tp_sl({"BTC": 105.0})
+check("未到价不触发", ev == [])
+ev = w6.check_tp_sl({"BTC": 111.0})
+check("现货止盈触发", len(ev) == 1 and "止盈" in ev[0])
+check("止盈后持仓清空", "BTC" not in w6.positions)
+check("止盈盈亏入账", approx(w6.realized_pnl, (111 - 100) * 50))
+
+w7 = Wallet("t7", 10000.0)
+w7.buy("ETH", 2000, 50.0, 0.0)                      # 40 个 @50
+w7.positions["ETH"]["sl_price"] = 45.0
+ev = w7.check_tp_sl({"ETH": 44.0})
+check("现货止损触发", len(ev) == 1 and "止损" in ev[0])
+check("止损盈亏为负", approx(w7.realized_pnl, (44 - 50) * 40))
+
+w8 = Wallet("t8", 10000.0)
+w8.open_short("SOL", 100, 5.0, 20.0, 0.0, 0.005)    # 空 100 @20
+w8.shorts["SOL"].tp_price = 18.0
+w8.shorts["SOL"].sl_price = 22.0
+ev = w8.check_tp_sl({"SOL": 19.0})
+check("空单未到价不触发", ev == [])
+ev = w8.check_tp_sl({"SOL": 17.5})
+check("空单止盈触发（跌）", len(ev) == 1 and "止盈" in ev[0])
+check("空单止盈后移除", "SOL" not in w8.shorts)
+check("空单止盈盈亏", approx(w8.realized_pnl, (20 - 17.5) * 100))
+
+# set_tp_sl API
+w9 = Wallet("t9", 10000.0)
+w9.buy("BTC", 1000, 100.0, 0.0)
+check("set_tp_sl 现货", w9.set_tp_sl("BTC", tp=120.0) == "spot")
+check("set 后值正确", approx(w9.positions["BTC"]["tp_price"], 120.0))
+check("set_tp_sl 清除", w9.set_tp_sl("BTC", tp=0.0) == "spot" and w9.positions["BTC"]["tp_price"] == 0.0)
+try:
+    w9.set_tp_sl("ETH", tp=1.0)
+    check("无持仓报错", False)
+except ValueError:
+    check("无持仓报错", True)
+w9.open_short("ETH", 1, 2.0, 100.0, 0.0, 0.005)
+check("auto 落到空单", w9.set_tp_sl("ETH", tp=1.0) == "short")
+w9.buy("ETH", 500, 100.0, 0.0)  # 现在现货+空单并存
+check("同时持有返回歧义", w9.set_tp_sl("ETH", tp=1.0) == "AMBIVALENT")
+check("明确 side=short", w9.set_tp_sl("ETH", sl=150.0, side="short") == "short")
+
+# ─── 价格警报 ───
+print("[价格警报]")
+a1 = PriceAlert(symbol="BTC", op=">=", price=100000, stream_id="s1")
+a2 = PriceAlert(symbol="ETH", op="<=", price=3000, stream_id="s1")
+check("上穿触发", a1.triggered(100001) and not a1.triggered(99999))
+check("下破触发", a2.triggered(2999) and not a2.triggered(3001))
+
+# 序列化含 tp/sl/alerts
+w10 = Wallet("t10", 5000.0)
+w10.buy("BTC", 1000, 100.0, 0.0)
+w10.positions["BTC"]["tp_price"] = 130.0
+w10.open_short("DOGE", 1000, 3.0, 0.5, 0.0, 0.005)
+w10.shorts["DOGE"].sl_price = 0.55
+al = PriceAlert(symbol="SOL", op="<=", price=100, stream_id="sx")
+w10.alerts[al.id] = al
+d10 = json.loads(json.dumps(w10.to_dict()))
+w10r = Wallet.from_dict(d10)
+check("tp/sl round-trip（现货）", approx(w10r.positions["BTC"]["tp_price"], 130.0))
+check("tp/sl round-trip（空单）", approx(w10r.shorts["DOGE"].sl_price, 0.55))
+check("alerts round-trip", len(w10r.alerts) == 1 and list(w10r.alerts.values())[0].op == "<=")
+# 旧格式（无 tp/sl/alerts 字段）向后兼容
+old = {"key": "old", "initial_cash": 100, "cash": 100, "positions": {"BTC": {"qty": 1, "avg_cost": 100}},
+       "shorts": {"ETH": {"symbol": "ETH", "qty": 1, "entry_price": 100, "leverage": 2, "margin": 50, "liquidation_price": 149.5}}}
+wold = Wallet.from_dict(old)
+check("旧钱包兼容（tp/sl 默认0）", wold.positions["BTC"].get("tp_price", 0) == 0 and wold.shorts["ETH"].tp_price == 0)
+check("旧钱包兼容（alerts 空）", wold.alerts == {})
 
 # ─── 图表 ───
 print("[图表]")

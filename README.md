@@ -9,8 +9,12 @@
 - 📡 **真实行情**：接入 Binance / OKX / Gate.io / Coinbase 四家公共行情 API（无需 API key），启动自动测速选最快的源，失败自动降级
 - 💰 **现货交易**：按数量或金额（`100u`）买入、卖出、清仓
 - 📉 **杠杆做空**：开空单、可设杠杆、爆仓线实时监控、爆仓主动告警
+- 🎯 **止盈止损**：现货与空单均支持，后台巡检自动平仓
+- 🔔 **价格警报**：上穿/下破目标价自动提醒（含 AI Tool，可对话式设置）
 - 🔁 **定投计划**：周期自动买入（DCA），可暂停/恢复/删除
 - 📊 **K线图 & 资产曲线**：`render.html2png` 渲染成图片发送，失败自动降级文字迷你图
+- 🗓 **每日报告**：定时汇报当日盈亏与持仓（时间可配）
+- 🏆 **排行榜**：chat 模式下各钱包总资产排名
 - 🤖 **AI 自主交易**：4 个 Tool 让麦麦在聊天中自己查行情、下单、汇报持仓——「麦麦全仓梭哈ETH」
 - 👛 **钱包模式**：`global` 全局单钱包（默认）或 `chat` 每聊天流独立
 
@@ -43,9 +47,12 @@ git clone https://github.com/KurohaneKaoruko/Mai-Bitcoin-Sim.git plugins/mai-bit
 | `/coin curve` | 资产曲线 |
 | `/coin dca add BTC 100u 6h` | 定投：每 6h 买 100U 的 BTC |
 | `/coin dca list / del <id> / pause <id> / resume <id>` | 定投管理 |
+| `/coin alert add BTC >= 100000` | 价格警报（list / del <id>） |
+| `/coin tp BTC 110000` | 设止盈（`sl` 同理；`clear` 清除；现货空单并存时加 `spot`/`short`） |
+| `/coin rank` | 钱包排行榜（chat 模式） |
 | `/coin market` | 大盘概览（BTC/ETH/SOL/BNB） |
 | `/coin source` | 四大交易所测速 |
-| `/coin alert` | 查看/检测爆仓通知目标解析是否成功 |
+| `/coin notify` | 查看/检测主动通知目标 |
 | `/coin reset 确认` | 重置钱包 |
 
 ## 配置
@@ -65,8 +72,10 @@ git clone https://github.com/KurohaneKaoruko/Mai-Bitcoin-Sim.git plugins/mai-bit
 | `trading.maintenance_margin_rate` | `0.005` | 维持保证金率（爆仓线） |
 | `market.price_cache_ttl` | `10` | 价格缓存秒数 |
 | `chart.kline_interval` / `kline_limit` | `1h` / `72` | 默认 K 线参数 |
-| `task.tick_seconds` | `60` | 后台巡检间隔（爆仓/定投/快照） |
+| `task.tick_seconds` | `60` | 后台巡检间隔（爆仓/止盈止损/警报/定投/快照） |
 | `task.liquidation_alert` | `true` | 爆仓主动告警 |
+| `task.daily_report` | `true` | 每日收益报告 |
+| `task.report_hour` | `20` | 每日报告发送时间（24h 制） |
 | `task.alert_targets` | `[]` | 主动通知（爆仓/定投异常）发送目标：群号或QQ号列表；留空则发给钱包最近活跃的聊天流 |
 
 ## 数据与规则
@@ -76,6 +85,8 @@ git clone https://github.com/KurohaneKaoruko/Mai-Bitcoin-Sim.git plugins/mai-bit
   - 开空占用保证金 = 名义价值 / 杠杆
   - 爆仓价 = 开仓价 × (1 + 1/杠杆 − 维持保证金率)
   - 标记价触及爆仓线 → 损失全部保证金，插件主动发爆仓警报
+- 止盈止损：现货 TP 在上方/SL 在下方；空单相反（TP 下方/SL 上方）。触发即全量平仓（免手续费），方向设反会立即触发（有提示但不阻止）
+- 价格警报触发后自动删除，通知发到设置时的聊天流
 - 爆仓等主动通知的送达目标由 `task.alert_targets` 控制（群号/QQ号，多个逐个发送）；
   未配置时发给钱包最近活跃的聊天流。目标需是麦麦已知的会话（在该群/私聊里说过话），
   可用 `/coin alert` 实时检测解析结果
