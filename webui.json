@@ -345,7 +345,7 @@
         },
         {
           "type": "grid",
-          "columns": 4,
+          "columns": 3,
           "label": "快捷操作",
           "children": [
             {
