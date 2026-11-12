@@ -29,7 +29,8 @@
     "send.image",
     "render.html2png",
     "chat.get_stream_by_group_id",
-    "chat.get_stream_by_user_id"
+    "chat.get_stream_by_user_id",
+    "llm.generate"
   ],
   "plugin_type": "game",
   "i18n": {
