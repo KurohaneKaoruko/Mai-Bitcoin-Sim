@@ -45,6 +45,14 @@ def next_funding_ts(t: int) -> int:
 
 # ─────────────────────────── 配置 ───────────────────────────
 
+class PluginSection(PluginConfigBase):
+    """插件基础设置（宿主保留节）"""
+    __ui_label__ = "插件"
+    __ui_order__ = 0
+    enabled: bool = Field(default=True, description="插件总开关")
+    config_version: str = Field(default="0.3.1", description="配置版本号；配置结构变更时递增，宿主据此迁移")
+
+
 class MainConfig(PluginConfigBase):
     """基础配置"""
     __ui_label__ = "基础"
@@ -103,6 +111,7 @@ class TaskConfig(PluginConfigBase):
 class CryptoTraderConfig(PluginConfigBase):
     """麦麦炒币模拟器配置"""
     __ui_label__ = "麦麦炒币模拟器"
+    plugin: PluginSection = Field(default_factory=PluginSection)
     main: MainConfig = Field(default_factory=MainConfig)
     trading: TradingConfig = Field(default_factory=TradingConfig)
     market: MarketConfig = Field(default_factory=MarketConfig)
