@@ -1520,6 +1520,8 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
             ToolParameterInfo(name="symbol", param_type=ToolParamType.STRING, description="币种符号，如 BTC、ETH、SOL、DOGE", required=True),
             ToolParameterInfo(name="stream_id", param_type=ToolParamType.STRING, description="当前聊天流ID（若上下文提供）", required=False),
         ],
+        visibility="visible",
+        core_tool=True,
     )
     async def tool_get_price(self, symbol: str, stream_id: str = "", **kwargs):
         try:
@@ -1537,6 +1539,8 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
         parameters=[
             ToolParameterInfo(name="stream_id", param_type=ToolParamType.STRING, description="当前聊天流ID", required=False),
         ],
+        visibility="visible",
+        core_tool=True,
     )
     async def tool_get_portfolio(self, stream_id: str = "", **kwargs):
         try:
@@ -1562,6 +1566,8 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
             ToolParameterInfo(name="leverage", param_type=ToolParamType.STRING, description="杠杆倍数（仅 long/short 用），如 5", required=False),
             ToolParameterInfo(name="stream_id", param_type=ToolParamType.STRING, description="当前聊天流ID", required=False),
         ],
+        visibility="visible",
+        core_tool=True,
     )
     async def tool_trade(self, action: str, symbol: str, amount: str, leverage: str = "", stream_id: str = "", **kwargs):
         cfg = self.config.trading
@@ -1608,6 +1614,8 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
             ToolParameterInfo(name="price", param_type=ToolParamType.STRING, description="目标价", required=True),
             ToolParameterInfo(name="stream_id", param_type=ToolParamType.STRING, description="当前聊天流ID", required=False),
         ],
+        visibility="visible",
+        core_tool=True,
     )
     async def tool_set_alert(self, symbol: str, op: str, price: str, stream_id: str = "", **kwargs):
         try:
@@ -1627,6 +1635,8 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
         name="crypto_market_overview",
         description="获取加密货币大盘概览：BTC、ETH 等主流币的24小时行情，用于聊大盘走势、市场情绪。",
         parameters=[],
+        visibility="visible",
+        core_tool=True,
     )
     async def tool_market_overview(self, **kwargs):
         try:
