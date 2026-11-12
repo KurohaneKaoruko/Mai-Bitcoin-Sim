@@ -31,7 +31,7 @@ from typing import List  # noqa: E402
 from core.chart import curve_html, kline_html, kline_text, sparkline  # noqa: E402
 from core.journal import Journal  # noqa: E402
 from core.market import MarketAggregator, Ticker24h, normalize_symbol  # noqa: E402
-from core.replay import ReplayEngine, ReplayResult  # noqa: E402
+from core.replay import STRATEGIES, ReplayEngine, ReplayResult  # noqa: E402
 from core.wallet import DCAPlan, FuturesPosition, PriceAlert, Trade, Wallet, WalletStore, now  # noqa: E402
 
 PLUGIN_VERSION = "0.4.0"
@@ -406,17 +406,24 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
         return {"total": len(all_entries), "counts": counts, "entries": rows}
 
     @API("run_replay", description="页面触发历史回放（钱包拨回过去，逐K线重演爆仓/止盈止损/资金费）", version="1")
-    async def api_run_replay(self, preset: str = "week", until: str = "") -> Dict[str, Any]:
-        """WebUI 触发回放。preset: day/week/month/quarter/year；until: 可选 'YYYY-MM-DD'。"""
+    async def api_run_replay(
+        self, preset: str = "week", until: str = "",
+        symbol: str = "BTC", strategy: str = "dca", amount: float = 100.0,
+    ) -> Dict[str, Any]:
+        """WebUI 触发回放。preset: day/week/month/quarter/year；until: 可选 'YYYY-MM-DD'。
+
+        strategy: dca/hold/none；amount 为 USDT 金额（strategy=none 时忽略）。
+        """
         try:
-            rest = []
+            rest = [symbol] if symbol else []
+            rest.append(preset)
+            if strategy and strategy != "none":
+                rest += [strategy, f"{amount}u"]
             if until:
                 u = self._parse_until(until)
                 if u is None:
                     return {"success": False, "message": f"日期无效：{until}（格式 YYYY-MM-DD）"}
-                rest = ["until", until, preset]
-            else:
-                rest = [preset]
+                rest += ["until", until]
             # 回放作用于全局钱包（WebUI 侧无聊天流上下文）
             text = await self._cmd_replay(WalletStore.GLOBAL_KEY, rest)
             return {"success": True, "message": text}
@@ -442,14 +449,15 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
     async def api_replay_status(self) -> Dict[str, Any]:
         presets = {k: {"interval": v[0], "candles": v[1]} for k, v in self._REPLAY_PRESETS.items()}
         if not hasattr(self, "store"):
-            return {"ready": False, "presets": presets}
+            return {"ready": True, "presets": presets}
         w = await self.store.get(WalletStore.GLOBAL_KEY)
         has_activity = bool(w.trades or w.positions or w.shorts)
         return {
-            "ready": has_activity,
+            "ready": True,   # 带策略回放空钱包也能跑；ready 只影响提示文案
+            "has_activity": has_activity,
             "presets": presets,
             "max_candles": int(self.config.task.replay_max_candles),
-            "hint": "" if has_activity else "钱包还是空的：先在聊天里交易一两笔，或等 AI 自主下单后再回放",
+            "hint": "" if has_activity else "钱包是空的：选好策略和金额即可回放，跑完即有成交与曲线",
         }
 
     # ── 后台任务：爆仓检查 + 定投 + 快照 + 定期重测速 ──
@@ -880,8 +888,10 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
             "/coin                     资产总览",
             "/coin price BTC [ETH...]  实时价格 + 24h涨跌（支持中文币名）",
             "/coin funding [BTC]       当前资金费率（缺省=持仓币种）",
-            "/coin replay [week]        历史回放：拨回过去重演行情（day/week/month/quarter/year）",
-            "/coin replay until 2025-01-01 week   从指定日期回放一周",
+            "/coin replay [币种] <时段> [策略 金额u]  历史回放：拨回过去重演行情",
+            "/coin replay BTC week dca 100u    例：回放一周，每日定投100U买入BTC",
+            "/coin replay BTC month hold 1000u 例：回放一月，期初一次性买入",
+            "/coin replay ... until 2025-01-01 从指定日期回放（让麦麦经历那段市场）",
             "/coin buy BTC 100u        买入100U的BTC（或 /coin buy BTC 0.01 按数量）",
             "/coin sell BTC all        卖出（all=清仓，也可写数量）",
             "/coin short BTC 0.01 5x   开空单（默认杠杆见配置，0.01张×5倍）",
@@ -973,61 +983,99 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
         return None
 
     async def _cmd_replay(self, stream_id: str, rest: List[str]) -> str:
-        """历史回放：/coin replay <预设|.until 日期> [快照密度]
+        """历史回放：/coin replay [币种] <预设> [dca|hold 金额u] [until 日期]
 
         例：
-          /coin replay week              回放最近一周（1h K线）
-          /coin replay month             回放最近一月
-          /coin replay until 2025-01-01 week   从该时点回放一周
-        回放会把钱包送回过去时点，逐根K线跑爆仓/止盈止损/资金费，结束后回到实时盘。
+          /coin replay BTC week dca 100u     回放最近一周，每日定投 100 U 买入 BTC
+          /coin replay BTC month hold 1000u  回放最近一月，期初一次性买入 1000 U
+          /coin replay week                  不带策略=只重演已有持仓的风控（爆仓/止盈止损）
+          /coin replay BTC week dca 100u until 2025-01-01   从指定日期回放一周
+        带策略时钱包先重置到初始资金，回放产生真实成交与资产曲线，结束后回到实时盘。
         """
         cfg = self.config
         w = await self.store.get(stream_id)
-        if not w.trades and not w.positions and not w.shorts:
-            raise UserError("钱包还是空的，先交易一两笔再回放（回放作用于已有持仓/仓位）")
 
         until_ts: Optional[int] = None
-        preset = ""
         args = list(rest)
-        if args and args[0] == "until":
-            if len(args) < 3:
-                raise UserError("用法：/coin replay until <日期> <预设>  例：/coin replay until 2025-01-01 week")
-            until_ts = self._parse_until(args[1])
+        if "until" in args:
+            i = args.index("until")
+            if i + 2 > len(args):
+                raise UserError("until 后要跟日期，例：until 2025-01-01")
+            until_ts = self._parse_until(args[i + 1])
             if until_ts is None:
-                raise UserError(f"日期无效：{args[1]}（格式 2025-01-01 或 2025-01-01 08:00）")
-            args = args[2:]
+                raise UserError(f"日期无效：{args[i + 1]}（格式 2025-01-01 或 2025-01-01 08:00）")
+            args = args[:i] + args[i + 2:]
         if not args:
             raise UserError(
-                "用法：/coin replay <day|week|month|quarter|year> [until 日期]\n"
-                "例：/coin replay week　　/coin replay until 2025-01-01 month"
+                "用法：/coin replay [币种] <day|week|month|quarter|year> [dca|hold 金额u] [until 日期]\n"
+                "例：/coin replay BTC week dca 100u（每日定投）　/coin replay BTC month hold 1000u（一次性买入）\n"
+                "不带策略 = 只重演已有持仓的风控事件"
             )
+        symbol = ""
         preset = args[0].lower()
+        if preset not in self._REPLAY_PRESETS:
+            # 第一个参数是币种，预设后移
+            symbol = normalize_symbol(args[0])
+            args = args[1:]
+            if not args:
+                raise UserError(f"缺少时段预设（{'/'.join(self._REPLAY_PRESETS)}），例：/coin replay {symbol} week dca 100u")
+            preset = args[0].lower()
+            args = args[1:]
         if preset not in self._REPLAY_PRESETS:
             raise UserError(f"未知预设：{preset}（可选 {'/'.join(self._REPLAY_PRESETS)}）")
         interval, count = self._REPLAY_PRESETS[preset]
         count = min(count, cfg.task.replay_max_candles)
 
+        # 策略解析（可选）
+        strategy, amount, is_usdt = "", 0.0, False
+        if args:
+            strategy = args[0].lower()
+            if strategy in STRATEGIES:
+                if len(args) < 2:
+                    raise UserError(f"策略 {strategy} 需要金额，例：dca 100u")
+                amount, is_usdt = parse_amount(args[1])
+                if amount is None or not is_usdt or amount <= 0:
+                    raise UserError(f"金额无效：{args[1]}（写 100u 这样的 USDT 金额）")
+                args = args[2:]
+            else:
+                raise UserError(f"未知策略：{args[0]}（可选 dca=每日定投 / hold=一次性买入；不带策略=只重演风控）")
+        if args:
+            raise UserError(f"多余参数：{' '.join(args)}")
+
+        # 回放币种：显式 > 持仓最大敞口 > BTC
+        if not symbol:
+            if w.positions:
+                symbol = max(w.positions, key=lambda s: w.positions[s]["qty"])
+            elif w.shorts:
+                symbol = next(iter(w.shorts.values())).symbol
+            else:
+                symbol = "BTC"
+
+        # 带策略时重置钱包，从初始资金开始回放；否则要求钱包有内容可重演
+        if strategy:
+            reset = True
+        else:
+            if not w.trades and not w.positions and not w.shorts:
+                raise UserError(
+                    "钱包还是空的，回放无事可做。带个策略吧，例：/coin replay BTC week dca 100u"
+                )
+            reset = False
+
         # 拉历史K线：endTime = until（缺省=现在）
         import time as _time
         end_ms = (until_ts if until_ts else int(_time.time())) * 1000
-        # 多拉一根，回放从「该时点的前一根收盘」开始（起点价格=首根 open）
-        sym_hint = sorted(set(w.positions) | {sp.symbol for sp in w.shorts.values()})
-        replay_syms = sym_hint[:1] if sym_hint else ["BTC"]
-        # 回放主币种 = 最大敞口币种；现货持仓里有多个币种时提示仅按主币种回放
         try:
-            candles = await self.market.get_klines_history(replay_syms[0], interval, end_ms, limit=count + 1)
+            candles = await self.market.get_klines_history(symbol, interval, end_ms, limit=count + 1)
         except Exception as e:  # noqa: BLE001
             raise UserError(f"历史K线拉取失败：{e}") from e
         if len(candles) < 2:
             raise UserError("该时段历史K线不足")
-        symbol = replay_syms[0]
         start_dt = candles[0].ts
         end_dt = candles[-1].ts
 
-        # 资金费率结算偏好
-        funding_default = cfg.trading.funding_default
         engine = ReplayEngine(
-            w, fee_rate=cfg.trading.futures_fee, funding_default=funding_default,
+            w, fee_rate=cfg.trading.spot_fee if strategy else cfg.trading.futures_fee,
+            funding_default=cfg.trading.funding_default,
             mmr=cfg.trading.maintenance_margin_rate,
         )
 
@@ -1035,16 +1083,24 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
             if hasattr(self, "journal"):
                 await self.journal.log("system", "历史回放事件", detail=text[:500])
 
-        res: ReplayResult = await engine.run(candles, symbol, interval, on_event=on_event)
+        res: ReplayResult = await engine.run(
+            candles, symbol, interval, on_event=on_event,
+            strategy=strategy, strategy_amount=amount, reset_wallet=reset,
+        )
 
         # 回放产生的快照与成交保留（历史时间戳）；保存钱包
         await self.store.save(w)
+        strat_desc = (
+            f"{strategy.upper()}×{res.strategy_trades} 笔投入 {res.strategy_cost:,.0f} U"
+            if strategy else "纯风控重演（无新交易）"
+        )
         await self.journal.log(
             "system",
             f"历史回放 {symbol} {preset}（{fmt_ts(start_dt)} → {fmt_ts(end_dt)}）",
             detail=(
-                f"K线 {res.candles} 根；爆仓 {res.liquidations}、止盈止损 {res.tp_sl_hits}、"
-                f"资金费 {res.fundings} 次；资产 {res.value_before:,.0f} → {res.value_after:,.0f} U"
+                f"K线 {res.candles} 根；策略 {strat_desc}；爆仓 {res.liquidations}、"
+                f"止盈止损 {res.tp_sl_hits}、资金费 {res.fundings} 次；"
+                f"资产 {res.value_before:,.0f} → {res.value_after:,.0f} U"
             ),
         )
 
@@ -1055,10 +1111,15 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
         lines = [
             f"🎬 历史回放完成 {symbol}（{s_dt} → {e_dt}，{interval}×{res.candles}）",
             f"行情：{fmt_price(res.start_price)} → {fmt_price(res.end_price)}（{fmt_pct(chg)}）",
-            f"事件：💥爆仓 {res.liquidations}　🎯止盈止损 {res.tp_sl_hits}　💸资金费 {res.fundings}",
-            f"资产：{res.value_before:,.2f} → {res.value_after:,.2f} U（{fmt_pct(res.pnl_pct)}）",
-            "⏰ 已回到实时盘，用 /coin 看当前持仓",
         ]
+        if strategy:
+            pos = w.positions.get(symbol)
+            hold = f"，现持 {fmt_qty(pos['qty'])} {symbol}" if pos else ""
+            ret = (res.value_after / res.strategy_cost - 1) * 100 if res.strategy_cost else 0.0
+            lines.append(f"策略：{strategy.upper()} {res.strategy_trades} 笔投入 {res.strategy_cost:,.2f} U → 现值 {res.value_after:,.2f} U（{fmt_pct(ret)}）{hold}")
+        lines.append(f"事件：💥爆仓 {res.liquidations}　🎯止盈止损 {res.tp_sl_hits}　💸资金费 {res.fundings}")
+        lines.append(f"资产：{res.value_before:,.2f} → {res.value_after:,.2f} U（{fmt_pct(res.pnl_pct)}）")
+        lines.append("⏰ 已回到实时盘，用 /coin 看当前持仓")
         for n in res.notes[-5:]:
             lines.append(f"· {n}")
         if len(res.notes) > 5:

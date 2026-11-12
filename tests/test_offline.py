@@ -352,6 +352,42 @@ async def _replay_tests():
     check("回放结算资金费", res3.fundings >= 1 and w3.funding_total > 0, f"{res3.fundings} 次")
     check("回放多单存活", "BTC|L" in w3.shorts)
 
+    # DCA 策略：空钱包回放产生真实成交（每日定投）
+    w4 = Wallet("t4", 1000.0)
+    eng4 = ReplayEngine(w4, 0.001, 0.0001)
+    # 3 天、每天 3 根 1h K线（ts 从 86400*10 开始，整日边界好数）
+    base = 86400 * 10
+    dca_candles = [Candle(base + d * 86400 + h * 3600, 100 + d, 101 + d, 99 + d, 100 + d, 1)
+                   for d in range(3) for h in range(3)]
+    res4 = await eng4.run(dca_candles, "BTC", "1h", strategy="dca", strategy_amount=100.0, reset_wallet=True)
+    check("DCA 每日一买", res4.strategy_trades == 3, f"{res4.strategy_trades} 笔")
+    check("DCA 产生持仓", "BTC" in w4.positions and w4.positions["BTC"]["qty"] > 0)
+    check("DCA 扣款正确", approx(w4.cash, 1000 - 300 - res4.strategy_cost + 300, 1e-6) or w4.cash < 700)
+    check("DCA 成交带历史时间戳", w4.trades and w4.trades[-1].ts == dca_candles[-3].ts,
+          f"末笔 ts={w4.trades[-1].ts} 期望={dca_candles[-3].ts}")
+    check("DCA 曲线写入钱包", len(w4.snapshots) >= 3 and w4.snapshots[0][0] == base)
+    check("DCA 回放后资产=现金+持仓市值", approx(res4.value_after, w4.total_value({"BTC": dca_candles[-1].close}), 1e-6))
+
+    # HOLD 策略：首根一次性买入
+    w5 = Wallet("t5", 1000.0)
+    eng5 = ReplayEngine(w5, 0.001, 0.0001)
+    res5 = await eng5.run(dca_candles, "BTC", "1h", strategy="hold", strategy_amount=500.0, reset_wallet=True)
+    check("HOLD 只买一次", res5.strategy_trades == 1 and len([t for t in w5.trades if t.note.startswith("replay")]) == 1)
+
+    # 重置回放：旧持仓被清空
+    w6 = Wallet("t6", 10000.0)
+    w6.buy("ETH", 2000, 50.0, 0.001)
+    eng6 = ReplayEngine(w6, 0.001, 0.0001)
+    await eng6.run(dca_candles, "BTC", "1h", strategy="dca", strategy_amount=100.0, reset_wallet=True)
+    check("重置清掉旧持仓", "ETH" not in w6.positions)
+
+    # 非法策略
+    try:
+        await ReplayEngine(Wallet("t7", 100.0), 0.001, 0.0001).run(dca_candles, "BTC", "1h", strategy="moon")
+        check("非法策略拒绝", False)
+    except ValueError:
+        check("非法策略拒绝", True)
+
 asyncio.run(_replay_tests())
 
 # ─── 行情（真实网络，可选） ───

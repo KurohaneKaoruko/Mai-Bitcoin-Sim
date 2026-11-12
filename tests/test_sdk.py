@@ -405,31 +405,33 @@ async def main():
     print("[历史回放]")
     rs = await p.api_replay_status()
     check("回放状态结构", "presets" in rs and "week" in rs["presets"], str(rs))
-    # 先交易一笔 → 可回放，跑最近1天（1h×24，真实历史K线）
-    ok, msg, _ = await run_cmd("buy BTC 100u")
-    check("回放前买入", ok, msg)
-    rs2 = await p.api_replay_status()
-    check("交易后可回放", rs2["ready"])
-    # 非法参数
+    # 空钱包+策略 → 直接回放（这正是回放的核心用途：快速看到结果）
     r1 = await p.api_run_replay(preset="bogus")
     check("非法预设拒绝", not r1["success"])
     r2 = await p.api_run_replay(preset="day", until="not-a-date")
     check("非法日期拒绝", not r2["success"] and "日期" in r2["message"], r2["message"])
-    r3 = await p.api_run_replay(preset="day")
-    check("页面回放成功", r3["success"], r3["message"])
+    r3 = await p.api_run_replay(preset="day", symbol="BTC", strategy="dca", amount=100.0)
+    check("空钱包带策略回放成功", r3["success"], r3["message"])
     if r3["success"]:
-        check("回放结果含摘要", "历史回放完成" in r3["message"] and "资产" in r3["message"], r3["message"][:80])
+        check("回放产生成交", "DCA" in r3["message"] and "投入" in r3["message"], r3["message"][:120])
+    # 回放后钱包有持仓与曲线
+    dash = await p.api_get_dashboard()
+    ov = dash["overview"]
+    check("回放后资产恒等式", approx(ov["total"], ov["cash"] + ov["spot_value"] + ov["margin"] + ov["fut_upnl"], 0.02), str(ov))
+    check("回放后有持仓", len(dash["spot"]) > 0, str(dash["spot"][:1]))
+    check("回放后曲线多条", len(dash["curve"]) > 3, f"{len(dash['curve'])} 点")
+    check("回放后有成交", len(dash["trades"]) > 0)
     # until 定点回放（远期数据稳定：2025-01-01）
-    r4 = await p.api_run_replay(preset="day", until="2025-01-01")
+    r4 = await p.api_run_replay(preset="day", symbol="BTC", strategy="hold", amount=500.0, until="2025-01-01")
     check("until 定点回放", r4["success"], r4["message"])
-    # 命令入口同样可用（先用非法参数验证帮助文案）
+    # 策略=none：纯风控重演（此时钱包有内容，应成功）
+    r5 = await p.api_run_replay(preset="day", symbol="BTC", strategy="none")
+    check("纯风控重演模式", r5["success"], r5["message"])
+    # 命令入口：新语法
     ok, msg, _ = await run_cmd("replay")
     check("replay 无参提示用法", not ok and "用法" in msg, msg)
-    ok, msg, _ = await run_cmd("replay week")
-    check("replay 命令成功", ok, msg)
-    # 回放后钱包仍在且资产恒等
-    ov2 = (await p.api_get_dashboard())["overview"]
-    check("回放后总资产恒等式", approx(ov2["total"], ov2["cash"] + ov2["spot_value"] + ov2["margin"] + ov2["fut_upnl"], 0.02), str(ov2))
+    ok, msg, _ = await run_cmd("replay BTC day dca 100u")
+    check("replay 命令带策略", ok, msg)
     # 回放事件入 system 日志
     await asyncio.sleep(0.3)
     j5 = await p.api_get_journal(limit=100, kind="system")

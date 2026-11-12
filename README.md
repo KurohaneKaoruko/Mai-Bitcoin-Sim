@@ -18,7 +18,7 @@
 - 🤖 **AI 自主交易**：5 个 Tool 让麦麦在聊天中自己查行情、下单、设警报、汇报持仓——「麦麦全仓梭哈ETH」
 - 🖥 **WebUI 仪表盘**：MaiBot WebUI 侧栏「炒币模拟器」单页双标签（行情与持仓 / 决策日志），实时总览、持仓、合约、成交与资产曲线（30s 自动刷新），页面可直接触发**历史回放**与**钱包重置**
 - 🧠 **决策日志**：完整记录每次 LLM 交易决策的思考过程（reasoning）、用户命令与后台事件（爆仓/止盈止损/资金费/警报），仪表盘「决策日志」标签页可查，支持类型筛选
-- ⏪ **历史回放**：把模拟盘拨回过去某个时点，按真实历史K线逐根重演爆仓/止盈止损/资金费，结束后自动回到实时盘——新开功能快速看结果，或让麦麦重历某段行情
+- ⏪ **历史回放**：把模拟盘拨回过去某个时点，选策略（每日定投 DCA / 一次性买入 HOLD）按真实历史K线重演，产生真实成交、爆仓/止盈止损与资产曲线，结束后自动回到实时盘——空钱包也能跑，新开功能立刻看到结果
 - 👛 **钱包模式**：`global` 全局单钱包（默认）或 `chat` 每聊天流独立
 
 ## 安装
@@ -41,8 +41,8 @@ git clone https://github.com/KurohaneKaoruko/Mai-Bitcoin-Sim.git plugins/mai-bit
 | `/coin help` | 帮助 |
 | `/coin price BTC [ETH...]` | 实时价格 + 24h 涨跌（多币可一起查；支持中文币名：`/coin price 比特币`） |
 | `/coin funding [BTC]` | 当前资金费率（缺省 = 持仓币种） |
-| `/coin replay [week]` | 历史回放：拨回过去重演行情（预设 `day/week/month/quarter/year`） |
-| `/coin replay until 2025-01-01 week` | 从指定日期回放一周（让麦麦经历那段时间的市场） |
+| `/coin replay [币种] <时段> [策略 金额u]` | 历史回放：`BTC week dca 100u` 每日定投 / `BTC month hold 1000u` 一次性买入；不带策略=只重演已有持仓的风控 |
+| `/coin replay BTC week dca 100u until 2025-01-01` | 从指定日期回放一周（让麦麦经历那段时间的市场） |
 | `/coin buy BTC 100u` | 买入 100 U 的 BTC（`/coin buy BTC 0.01` 按数量） |
 | `/coin sell BTC all` | 卖出（`all` 清仓，或写数量） |
 | `/coin short ETH 100u 5x` | 合约开空：名义 100U × 5 倍杠杆 |
