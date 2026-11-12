@@ -1,0 +1,104 @@
+{
+  "schema_version": 2,
+  "required_capabilities": ["declarative_basic"],
+  "pages": [
+    {
+      "id": "dashboard",
+      "title": "炒币模拟器",
+      "description": "模拟钱包投资仪表盘：资产总览、持仓、合约、成交与资产曲线",
+      "icon": "chart",
+      "mode": "declarative",
+      "poll_interval_seconds": 30,
+      "queries": {
+        "dash": {
+          "api": "get_dashboard",
+          "version": "1",
+          "parameters": {}
+        }
+      },
+      "content": [
+        { "type": "text", "value": { "source": "dash", "field": "updated_at" }, "label": "数据时间" },
+        {
+          "type": "grid",
+          "columns": 4,
+          "label": "资产总览",
+          "children": [
+            { "type": "stat", "label": "总资产 (USDT)", "value": { "source": "dash", "field": "overview.total" } },
+            { "type": "stat", "label": "总盈亏 (USDT)", "value": { "source": "dash", "field": "overview.pnl" } },
+            { "type": "stat", "label": "收益率", "value": { "source": "dash", "field": "overview.pnl_pct" } },
+            { "type": "stat", "label": "可用现金", "value": { "source": "dash", "field": "overview.cash" } }
+          ]
+        },
+        {
+          "type": "grid",
+          "columns": 4,
+          "label": "资金构成",
+          "children": [
+            { "type": "stat", "label": "现货市值", "value": { "source": "dash", "field": "overview.spot_value" } },
+            { "type": "stat", "label": "现货浮盈", "value": { "source": "dash", "field": "overview.spot_upnl" } },
+            { "type": "stat", "label": "合约保证金", "value": { "source": "dash", "field": "overview.margin" } },
+            { "type": "stat", "label": "合约浮盈", "value": { "source": "dash", "field": "overview.fut_upnl" } },
+            { "type": "stat", "label": "已实现盈亏", "value": { "source": "dash", "field": "overview.realized_pnl" } }
+          ]
+        },
+        {
+          "type": "chart",
+          "label": "资产曲线 (USDT)",
+          "value": { "source": "dash", "field": "curve" },
+          "chart_type": "line",
+          "x": "t",
+          "y": "v"
+        },
+        {
+          "type": "table",
+          "label": "现货持仓",
+          "value": { "source": "dash", "field": "spot" },
+          "columns": [
+            { "field": "symbol", "label": "币种" },
+            { "field": "qty", "label": "数量" },
+            { "field": "avg_cost", "label": "成本" },
+            { "field": "price", "label": "现价" },
+            { "field": "value", "label": "市值" },
+            { "field": "upnl", "label": "浮盈" },
+            { "field": "upnl_pct", "label": "浮盈%" },
+            { "field": "tp", "label": "止盈" },
+            { "field": "sl", "label": "止损" }
+          ]
+        },
+        {
+          "type": "table",
+          "label": "合约仓位",
+          "value": { "source": "dash", "field": "futures" },
+          "columns": [
+            { "field": "symbol", "label": "币种" },
+            { "field": "side", "label": "方向" },
+            { "field": "qty", "label": "数量" },
+            { "field": "leverage", "label": "杠杆" },
+            { "field": "entry", "label": "开仓价" },
+            { "field": "price", "label": "标记价" },
+            { "field": "liq", "label": "爆仓价" },
+            { "field": "margin", "label": "保证金" },
+            { "field": "upnl", "label": "浮盈" },
+            { "field": "upnl_pct", "label": "收益率%" },
+            { "field": "tp", "label": "止盈" },
+            { "field": "sl", "label": "止损" }
+          ]
+        },
+        {
+          "type": "table",
+          "label": "最近成交",
+          "value": { "source": "dash", "field": "trades" },
+          "columns": [
+            { "field": "time", "label": "时间" },
+            { "field": "action", "label": "操作" },
+            { "field": "symbol", "label": "币种" },
+            { "field": "qty", "label": "数量" },
+            { "field": "price", "label": "价格" },
+            { "field": "amount", "label": "金额" },
+            { "field": "pnl", "label": "盈亏" }
+          ]
+        }
+      ]
+    }
+  ]
+}

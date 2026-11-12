@@ -24,7 +24,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase, Tool  # noqa: E402
+from maibot_sdk import API, Command, Field, MaiBotPlugin, PluginConfigBase, Tool  # noqa: E402
 from maibot_sdk.types import ToolParameterInfo, ToolParamType  # noqa: E402
 from typing import List  # noqa: E402
 
@@ -227,6 +227,131 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
                 self.ctx.logger.info("钱包模式切换: %s → %s", self.store.mode, mode)
                 await self.store.save_all()
                 self.store.mode = mode
+
+    # ── WebUI 仪表盘数据 ──
+
+    @API("get_dashboard", description="投资仪表盘：总览/持仓/合约/成交/资产曲线", version="1")
+    async def api_get_dashboard(self) -> Dict[str, Any]:
+        """WebUI 页面数据源。一次行情取数，返回全部面板快照。"""
+        if not hasattr(self, "store"):
+            return {"error": "插件尚未完成加载"}
+        wallets = await self.store.get_all()
+        if not wallets:
+            return {"error": "还没有钱包，先在聊天里发 /coin 开户"}
+
+        symbols: set = set()
+        for w in wallets:
+            symbols.update(w.positions.keys())
+            symbols.update(sp.symbol for sp in w.shorts.values())
+        prices = await self.market.get_prices(sorted(symbols)) if symbols else {}
+
+        # global 模式只有单钱包；chat 模式下聚合展示主要钱包
+        overview_wallet = wallets[0] if self.store.mode == "global" else max(
+            wallets, key=lambda w: w.total_value(prices)
+        )
+        w = overview_wallet
+        total = w.total_value(prices)
+        pnl = total - w.initial_cash
+        pos_val, missing = w.positions_value(prices)
+        upnl_spot = sum(
+            (prices[sym] - pos["avg_cost"]) * pos["qty"]
+            for sym, pos in w.positions.items() if sym in prices
+        )
+        fut_upnl, _ = w.shorts_unrealized(prices)
+
+        overview = {
+            "wallet": w.key if self.store.mode == "chat" else "全局钱包",
+            "total": round(total, 2),
+            "pnl": round(pnl, 2),
+            "pnl_pct": round(pnl / w.initial_cash * 100, 2) if w.initial_cash else 0.0,
+            "cash": round(w.cash, 2),
+            "spot_value": round(pos_val, 2),
+            "margin": round(w.shorts_margin(), 2),
+            "spot_upnl": round(upnl_spot, 2),
+            "fut_upnl": round(fut_upnl, 2),
+            "realized_pnl": round(w.realized_pnl, 2),
+            "fees": round(w.fees_paid, 2),
+            "funding_total": round(w.funding_total, 2),
+            "initial_cash": round(w.initial_cash, 2),
+        }
+
+        spot_rows = []
+        for sym in sorted(w.positions):
+            pos = w.positions[sym]
+            p = prices.get(sym)
+            row = {
+                "symbol": sym,
+                "qty": round(pos["qty"], 8),
+                "avg_cost": round(pos["avg_cost"], 8),
+                "price": round(p, 8) if p is not None else None,
+                "tp": round(pos.get("tp_price", 0) or 0, 8) or None,
+                "sl": round(pos.get("sl_price", 0) or 0, 8) or None,
+            }
+            if p is not None:
+                val = pos["qty"] * p
+                u = (p - pos["avg_cost"]) * pos["qty"]
+                row["value"] = round(val, 2)
+                row["upnl"] = round(u, 2)
+                row["upnl_pct"] = round((p / pos["avg_cost"] - 1) * 100, 2) if pos["avg_cost"] else 0.0
+            spot_rows.append(row)
+
+        fut_rows = []
+        for key, sp in sorted(w.shorts.items()):
+            p = prices.get(sp.symbol)
+            row = {
+                "symbol": sp.symbol,
+                "side": "做多" if sp.side == "long" else "做空",
+                "qty": round(sp.qty, 8),
+                "leverage": f"{sp.leverage:g}x",
+                "entry": round(sp.entry_price, 8),
+                "liq": round(sp.liquidation_price, 8),
+                "margin": round(sp.margin, 2),
+                "tp": round(sp.tp_price, 8) or None,
+                "sl": round(sp.sl_price, 8) or None,
+            }
+            if p is not None:
+                u = sp.unrealized(p)
+                row["price"] = round(p, 8)
+                row["upnl"] = round(u, 2)
+                row["upnl_pct"] = round(u / sp.margin * 100, 2) if sp.margin else 0.0
+            fut_rows.append(row)
+
+        acts = {
+            "buy": "买入", "sell": "卖出", "short_open": "开空", "short_close": "平空",
+            "long_open": "开多", "long_close": "平多",
+            "liquidated": "爆仓", "dca_buy": "定投买", "dca_skip": "定投跳过",
+        }
+        trade_rows = []
+        for t in reversed(w.trades[-20:]):
+            trade_rows.append({
+                "time": fmt_ts(t.ts),
+                "action": acts.get(t.action, t.action),
+                "symbol": t.symbol,
+                "qty": round(t.qty, 8),
+                "price": round(t.price, 8),
+                "amount": round(t.amount, 2),
+                "pnl": round(t.pnl, 2) if t.action in ("sell", "short_close", "long_close", "liquidated") else None,
+            })
+
+        curve = [
+            {"t": fmt_ts(int(ts)), "v": round(v, 2)}
+            for ts, v in (w.snapshots or [])[-200:]
+        ]
+        if not curve:
+            w.snapshot(prices, force=True)
+            curve = [{"t": fmt_ts(int(w.snapshots[-1][0])), "v": round(w.snapshots[-1][1], 2)}]
+            await self.store.save(w)
+
+        return {
+            "mode": self.store.mode,
+            "updated_at": fmt_ts(now()),
+            "missing": missing,
+            "overview": overview,
+            "spot": spot_rows,
+            "futures": fut_rows,
+            "trades": trade_rows,
+            "curve": curve,
+        }
 
     # ── 后台任务：爆仓检查 + 定投 + 快照 + 定期重测速 ──
 

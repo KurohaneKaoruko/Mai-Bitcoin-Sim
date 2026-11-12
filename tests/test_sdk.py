@@ -7,7 +7,9 @@ Command 处理器全流程（含行情实网）、渲染降级。
 """
 
 import asyncio
+import json
 import logging
+import math
 import sys
 import time
 from pathlib import Path
@@ -27,6 +29,10 @@ from maibot_sdk.components import collect_components  # noqa: E402
 import plugin as plugin_mod  # noqa: E402
 
 PASS, FAIL = 0, 0
+
+
+def approx(a: float, b: float, tol: float = 1e-6) -> bool:
+    return math.isclose(a, b, rel_tol=tol, abs_tol=tol)
 
 
 def check(name: str, cond: bool, detail: str = "") -> None:
@@ -348,6 +354,26 @@ async def main():
     p.config.task.alert_targets = ["123456", "000000"]
     ok, msg, _ = await run_cmd("notify")
     check("notify 命令（有目标）", ok and "123456" in msg and "✅" in msg, msg)
+
+    print("[WebUI 仪表盘 API]")
+    infos = collect_components(p)
+    api_comps = [i for i in infos if i.get("type") == "API"]
+    check("注册 dashboard API", any(i["name"] == "get_dashboard" for i in api_comps), str([i.get("name") for i in api_comps]))
+
+    dash = await p.api_get_dashboard()
+    check("仪表盘返回结构", all(k in dash for k in ("overview", "spot", "futures", "trades", "curve")), str(dash.keys()))
+    ov = dash["overview"]
+    check("总览数值完备", all(k in ov for k in ("total", "pnl", "cash", "spot_value", "margin", "pnl_pct")), str(ov.keys()))
+    check("现货持仓行", isinstance(dash["spot"], list) and any(r["symbol"] in ("BTC", "ETH") for r in dash["spot"]), str(dash["spot"][:2]))
+    check("成交记录行", isinstance(dash["trades"], list) and len(dash["trades"]) > 0 and "action" in dash["trades"][0])
+    check("曲线数据点", isinstance(dash["curve"], list) and len(dash["curve"]) >= 1 and {"t", "v"} == set(dash["curve"][0].keys()))
+    check("总资产恒等式", approx(ov["total"], ov["cash"] + ov["spot_value"] + ov["margin"] + ov["fut_upnl"], 0.02), str(ov))
+    # webui.json 与 API 声明一致性
+    wj = json.loads((ROOT / "webui.json").read_text("utf-8"))
+    page = wj["pages"][0]
+    bound = {b["api"] for b in page["queries"].values()}
+    declared = {i["name"] for i in api_comps}
+    check("webui.json 绑定的 API 均已注册", bound <= declared, f"{bound} vs {declared}")
 
     print("[生命周期收尾]")
     await p.on_unload()
