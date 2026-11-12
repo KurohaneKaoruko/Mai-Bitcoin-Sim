@@ -43,10 +43,21 @@ FREE_DECISION_PROMPT = """你是模拟盘交易员「麦麦」，正在历史回
 标的：{symbol}（USDT 本位模拟盘）
 现价：{price:.6g}
 近12根{interval}K线收盘价（旧→新）：{closes}
+近12根累计涨跌：{trend}
 现金：{cash:,.2f} U
 现货持仓：{spot}
 合约仓位：{futures}
 最近动作：{recent}
+
+【你的目标】
+这是模拟盘，亏光也不心疼，没有真钱风险。你的任务：抓住这段行情赚钱，跑赢「全程拿U不动」。
+注意：全程 hold = 交白卷。有信号就要下单，做错了就止损离场再来一单。
+
+【策略参考（自由发挥）】
+- 收盘价一路走高（trend 明显为正）→ 顺势 buy 或 long
+- 一路走低（trend 明显为负）→ short，或清仓等反弹
+- 冲高回落 → 止盈卖出；深跌企稳 → 低吸
+- 逆势浮亏的仓果断 close，别扛单
 
 【可发动作用作（输出且仅输出一行，格式严格如下）】
 hold                      —— 不动
@@ -56,7 +67,7 @@ long <USDT名义> <杠杆>    —— 开杠杆多单，如：long 300 3
 short <USDT名义> <杠杆>   —— 开杠杆空单，如：short 200 5
 close <long|short>        —— 平掉对应合约单，如：close long
 
-要求：谨慎使用杠杆（≤10x），单次开仓名义价值不超过现金的一半；没有把握就 hold。
+要求：杠杆≤10x，单次开仓名义不超过现金一半；12根K线足够判断短线趋势，不必等更多数据。
 现在直接输出动作指令这一行，不要任何解释。"""
 
 
@@ -228,9 +239,16 @@ class ReplayEngine:
         self, symbol: str, c: Candle, closes: List[float], interval: str,
         ts_local: str, recent: str,
     ) -> str:
+        # 近12根累计涨跌幅（给小模型算好的趋势线索）
+        trend = "数据不足"
+        if len(closes) >= 2 and closes[0]:
+            pct = (closes[-1] / closes[0] - 1) * 100
+            direction = "上涨" if pct > 0 else ("下跌" if pct < 0 else "持平")
+            trend = f"{pct:+.2f}%（{direction}）"
         return FREE_DECISION_PROMPT.format(
             ts_local=ts_local, symbol=symbol, price=c.open, interval=interval,
             closes="、".join(f"{p:,.6g}" for p in closes),
+            trend=trend,
             cash=self.w.cash, spot=self._fmt_spot(), futures=self._fmt_futures(c.open),
             recent=recent or "（回放刚开始）",
         )
