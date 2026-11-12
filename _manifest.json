@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "kurohanekaoruko.mai-bitcoin-sim",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "name": "麦麦炒币模拟器",
   "description": "让麦麦用真实加密货币行情在本地模拟下单：现货买卖、杠杆做空、爆仓、定投、K线图与资产曲线，支持多交易所行情源自动测速切换。",
   "author": {

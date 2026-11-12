@@ -14,6 +14,7 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import List
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -89,6 +90,27 @@ class MockCtx:
         self.chat = MockChat()
         self.logger = logging.getLogger("test.plugin")
         self.paths = SimpleNamespace(data_dir=ROOT / "tests" / ".tmp_data")
+        # LLM mock：回放决策用。脚本按调用次序返回动作指令
+        self.llm_script: List[str] = []
+        self.llm_reasoning = "测试推理过程"
+        self.llm_calls = 0
+
+    class _LLM:
+        def __init__(self, outer: "MockCtx"):
+            self._outer = outer
+
+        async def generate(self, prompt: str = "", **kwargs):
+            self._outer.llm_calls += 1
+            i = min(self._outer.llm_calls - 1, len(self._outer.llm_script) - 1)
+            text = self._outer.llm_script[i] if self._outer.llm_script else "hold"
+            return {"success": True, "response": text, "reasoning": self._outer.llm_reasoning, "model": "mock"}
+
+    def __post_init__(self):
+        pass
+
+    @property
+    def llm(self):
+        return MockCtx._LLM(self)
 
 
 async def make_plugin(render_fail: bool = False):
@@ -405,37 +427,68 @@ async def main():
     print("[历史回放]")
     rs = await p.api_replay_status()
     check("回放状态结构", "presets" in rs and "week" in rs["presets"], str(rs))
-    # 空钱包+策略 → 直接回放（这正是回放的核心用途：快速看到结果）
-    r1 = await p.api_run_replay(preset="bogus")
-    check("非法预设拒绝", not r1["success"])
-    r2 = await p.api_run_replay(preset="day", until="not-a-date")
+    # 非法参数：现在 bogus 会被当币种处理（normalize 通过），多余日期参数才报错
+    r2 = await p.api_run_replay(preset="day", symbol="BTC", until="not-a-date")
+    deadline0 = time.time() + 90
+    while p._replay_task and not p._replay_task.done() and time.time() < deadline0:
+        await asyncio.sleep(0.5)
     check("非法日期拒绝", not r2["success"] and "日期" in r2["message"], r2["message"])
-    r3 = await p.api_run_replay(preset="day", symbol="BTC", strategy="dca", amount=100.0)
-    check("空钱包带策略回放成功", r3["success"], r3["message"])
+    # 自由交易回放：mock LLM 脚本（买入 → 持有 → 卖出），day=1h×24，节流至 6 次决策
+    p.config.task.replay_max_decisions = 6
+    ctx.llm_script = ["buy 300u", "hold", "hold", "sell all", "hold", "hold"]
+    ctx.llm_calls = 0
+    r3 = await p.api_run_replay(preset="day", symbol="BTC")
+    check("回放任务后台启动", r3["success"] and "已开始" in r3["message"], r3["message"])
     if r3["success"]:
-        check("回放产生成交", "DCA" in r3["message"] and "投入" in r3["message"], r3["message"][:120])
-    # 回放后钱包有持仓与曲线
-    dash = await p.api_get_dashboard()
-    ov = dash["overview"]
-    check("回放后资产恒等式", approx(ov["total"], ov["cash"] + ov["spot_value"] + ov["margin"] + ov["fut_upnl"], 0.02), str(ov))
-    check("回放后有持仓", len(dash["spot"]) > 0, str(dash["spot"][:1]))
-    check("回放后曲线多条", len(dash["curve"]) > 3, f"{len(dash['curve'])} 点")
-    check("回放后有成交", len(dash["trades"]) > 0)
-    # until 定点回放（远期数据稳定：2025-01-01）
-    r4 = await p.api_run_replay(preset="day", symbol="BTC", strategy="hold", amount=500.0, until="2025-01-01")
-    check("until 定点回放", r4["success"], r4["message"])
-    # 策略=none：纯风控重演（此时钱包有内容，应成功）
-    r5 = await p.api_run_replay(preset="day", symbol="BTC", strategy="none")
-    check("纯风控重演模式", r5["success"], r5["message"])
-    # 命令入口：新语法
+        # 等回放任务完成（真实拉取 1 天的 1h K线 + 6 次 mock 决策）
+        deadline = time.time() + 90
+        while p._replay_task and not p._replay_task.done() and time.time() < deadline:
+            await asyncio.sleep(0.5)
+        check("回放任务完成", p._replay_task is not None and p._replay_task.done())
+        replay_err = p._replay_task.exception() if p._replay_task.done() and not p._replay_task.cancelled() else None
+        check("回放无异常", replay_err is None, str(replay_err))
+        # 麦麦 LLM 被实际调用（节流后 ≥2 次：买入与卖出）
+        check("麦麦决策被调用", ctx.llm_calls >= 2, f"calls={ctx.llm_calls}")
+        # 决策日志有 LLM 记录（回放决策）
+        await asyncio.sleep(0.3)
+        jdec = await p.api_get_journal(limit=100, kind="llm")
+        check("回放决策入 llm 日志", any("回放决策" in e["title"] for e in jdec["entries"]), str(jdec["entries"][:1]))
+        jreason = [e for e in jdec["entries"] if "回放决策" in e["title"]]
+        check("决策含 reasoning", any(e.get("reasoning") for e in jreason), str(jreason[:1]))
+        # 回放结束日志
+        j5 = await p.api_get_journal(limit=100, kind="system")
+        check("回放结束入 system 日志", any("历史回放结束" in e["title"] for e in j5["entries"]), str(j5["entries"][:1]))
+        # 钱包有回放痕迹（成交+曲线）
+        dash = await p.api_get_dashboard()
+        ov = dash["overview"]
+        check("回放后资产恒等式", approx(ov["total"], ov["cash"] + ov["spot_value"] + ov["margin"] + ov["fut_upnl"], 0.02), str(ov))
+        check("回放后有成交", len(dash["trades"]) > 0)
+        check("回放后曲线多条", len(dash["curve"]) > 3, f"{len(dash['curve'])} 点")
+        # 回放中再触发 → 拒绝并发
+        ctx.llm_script = ["hold"]
+        r5 = await p.api_run_replay(preset="day", symbol="BTC")
+        if r5["success"]:
+            deadline = time.time() + 90
+            while p._replay_task and not p._replay_task.done() and time.time() < deadline:
+                await asyncio.sleep(0.5)
+        else:
+            check("并发回放拒绝", "正在运行" in r5["message"], r5["message"])
+    else:
+        check("回放启动失败跳过后续", False, r3["message"])
+    # 命令入口：立即返回「已开始」，回放后台执行，完成后主动发消息
+    ctx.llm_script = ["hold"]
     ok, msg, _ = await run_cmd("replay")
-    check("replay 无参提示用法", not ok and "用法" in msg, msg)
-    ok, msg, _ = await run_cmd("replay BTC day dca 100u")
-    check("replay 命令带策略", ok, msg)
-    # 回放事件入 system 日志
+    check("replay 命令立即返回已开始", ok and "回放开始" in msg, msg)
+    check("replay 命令无重复报错", "多余参数" not in msg, msg)
+    # 等命令触发的后台回放跑完
+    deadline = time.time() + 90
+    while p._replay_task and not p._replay_task.done() and time.time() < deadline:
+        await asyncio.sleep(0.5)
+    check("命令回放后台完成", p._replay_task is not None and p._replay_task.done())
+    # 回放中再开一次 → 拒绝（并发保护）；此时已跑完则改为验证参数校验
+    r_dup = await p.api_run_replay(preset="bogus")
+    check("非法预设立即拒绝", not r_dup["success"] and "预设" in r_dup["message"], r_dup["message"])
     await asyncio.sleep(0.3)
-    j5 = await p.api_get_journal(limit=100, kind="system")
-    check("回写入 system 日志", any("历史回放" in e["title"] for e in j5["entries"]), str(j5["entries"][:1]))
     # 重置 API（清场，恢复初始资金）
     rr = await p.api_reset_wallet()
     check("页面重置钱包", rr["success"] and "重置" in rr["message"], str(rr))

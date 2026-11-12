@@ -30,11 +30,11 @@ from typing import List  # noqa: E402
 
 from core.chart import curve_html, kline_html, kline_text, sparkline  # noqa: E402
 from core.journal import Journal  # noqa: E402
-from core.market import MarketAggregator, Ticker24h, normalize_symbol  # noqa: E402
-from core.replay import STRATEGIES, ReplayEngine, ReplayResult  # noqa: E402
+from core.market import Candle, MarketAggregator, Ticker24h, normalize_symbol  # noqa: E402
+from core.replay import ReplayEngine, ReplayResult, parse_free_action  # noqa: E402
 from core.wallet import DCAPlan, FuturesPosition, PriceAlert, Trade, Wallet, WalletStore, now  # noqa: E402
 
-PLUGIN_VERSION = "0.4.0"
+PLUGIN_VERSION = "0.5.0"
 KLINE_INTERVALS = ("5m", "15m", "1h", "4h", "1d")
 FUNDING_INTERVAL = 8 * 3600  # 资金费结算周期：8 小时（UTC 0/8/16 点对齐）
 
@@ -52,7 +52,7 @@ class PluginSection(PluginConfigBase):
     __ui_label__ = "插件"
     __ui_order__ = 0
     enabled: bool = Field(default=True, description="插件总开关", json_schema_extra={"label": "启用插件"})
-    config_version: str = Field(default="0.4.0", description="配置版本号；配置结构变更时递增，宿主据此迁移", json_schema_extra={"label": "配置版本"})
+    config_version: str = Field(default="0.5.0", description="配置版本号；配置结构变更时递增，宿主据此迁移", json_schema_extra={"label": "配置版本"})
 
 
 class MainConfig(PluginConfigBase):
@@ -119,6 +119,7 @@ class TaskConfig(PluginConfigBase):
     )
     journal_max_entries: int = Field(default=500, description="决策日志保留条数（LLM 决策/命令/后台事件环形记录）", json_schema_extra={"label": "决策日志上限 (条)"})
     replay_max_candles: int = Field(default=2000, description="历史回放单次最多 K 线根数（防误拉超长时段）", json_schema_extra={"label": "回放K线上限 (根)"})
+    replay_max_decisions: int = Field(default=48, description="历史回放麦麦自主决策次数上限（每次调用一次 LLM，控制耗时与开销）", json_schema_extra={"label": "回放决策上限 (次)"})
 
 
 class CryptoTraderConfig(PluginConfigBase):
@@ -207,6 +208,7 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
         self.market = MarketAggregator(price_ttl=cfg.market.price_cache_ttl)
         self.journal = Journal(data_dir, max_entries=cfg.task.journal_max_entries)
         self._tick_task = None
+        self._replay_task: Optional[asyncio.Task] = None   # 页面触发的后台回放
         self._last_report_day = -1
         self._liq_warn_ts: Dict[str, int] = {}   # 临近爆仓预警冷却：key -> 上次提醒时间戳
         self._sending = asyncio.Lock()
@@ -222,7 +224,8 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
         self.ctx.logger.info("mai-bitcoin-sim 就绪 ✓")
 
     async def on_unload(self) -> None:
-        for t in (getattr(self, "_tick_task", None), getattr(self, "_save_task", None)):
+        for t in (getattr(self, "_tick_task", None), getattr(self, "_save_task", None),
+                  getattr(self, "_replay_task", None)):
             if t:
                 t.cancel()
         try:
@@ -405,33 +408,58 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
                 counts[k] += 1
         return {"total": len(all_entries), "counts": counts, "entries": rows}
 
-    @API("run_replay", description="页面触发历史回放（钱包拨回过去，逐K线重演爆仓/止盈止损/资金费）", version="1")
+    @API("run_replay", description="页面触发历史回放（钱包拨回过去，麦麦自主交易重演行情）", version="1")
     async def api_run_replay(
-        self, preset: str = "week", until: str = "",
-        symbol: str = "BTC", strategy: str = "dca", amount: float = 100.0,
+        self, preset: str = "week", until: str = "", symbol: str = "BTC",
     ) -> Dict[str, Any]:
         """WebUI 触发回放。preset: day/week/month/quarter/year；until: 可选 'YYYY-MM-DD'。
 
-        strategy: dca/hold/none；amount 为 USDT 金额（strategy=none 时忽略）。
+        麦麦逐根K线自主决策交易，可能耗时数分钟：后台任务执行，本调用立即返回。
+        进度与每一步决策见决策日志，结束后仪表盘刷新可见成交与曲线。
         """
         try:
+            if self._replay_task and not self._replay_task.done():
+                return {"success": False, "message": "已有一次回放正在运行，等它跑完（决策日志可见进度）"}
+            if preset not in self._REPLAY_PRESETS:
+                return {"success": False, "message": f"未知时段预设：{preset}（可选 {'/'.join(self._REPLAY_PRESETS)}）"}
+            if not symbol:
+                return {"success": False, "message": "币种不能为空"}
             rest = [symbol] if symbol else []
             rest.append(preset)
-            if strategy and strategy != "none":
-                rest += [strategy, f"{amount}u"]
             if until:
                 u = self._parse_until(until)
                 if u is None:
                     return {"success": False, "message": f"日期无效：{until}（格式 YYYY-MM-DD）"}
                 rest += ["until", until]
-            # 回放作用于全局钱包（WebUI 侧无聊天流上下文）
-            text = await self._cmd_replay(WalletStore.GLOBAL_KEY, rest)
-            return {"success": True, "message": text}
+            # 回放作用于全局钱包（WebUI 侧无聊天流上下文）；后台执行，立即返回
+            await self._cmd_replay(WalletStore.GLOBAL_KEY, rest)
+            return {
+                "success": True,
+                "message": (
+                    f"⏪ 回放已开始（{symbol} {preset}）：麦麦将逐段行情自主决策交易。"
+                    "预计需要几分钟，每一步决策见决策日志，结束后仪表盘自动出现成交与曲线。"
+                ),
+            }
         except UserError as e:
             return {"success": False, "message": str(e)}
         except Exception as e:  # noqa: BLE001
             self.ctx.logger.exception("WebUI 回放失败")
             return {"success": False, "message": f"{type(e).__name__}: {e}"}
+
+    def _replay_done(self, task: "asyncio.Task[None]") -> None:
+        """回放后台任务收尾：异常兜底记日志。"""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(self.journal.log(
+                        "system", "历史回放异常终止", detail=f"{type(exc).__name__}: {exc}",
+                    ))
+            except RuntimeError:
+                pass
 
     @API("reset_wallet", description="页面重置全局钱包（清空持仓与记录，恢复初始资金）", version="1")
     async def api_reset_wallet(self) -> Dict[str, Any]:
@@ -445,19 +473,16 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
             self.ctx.logger.exception("WebUI 重置失败")
             return {"success": False, "message": f"{type(e).__name__}: {e}"}
 
-    @API("get_replay_status", description="回放参数预设与钱包可回放状态", version="1")
+    @API("get_replay_status", description="回放预设与运行状态", version="1")
     async def api_replay_status(self) -> Dict[str, Any]:
         presets = {k: {"interval": v[0], "candles": v[1]} for k, v in self._REPLAY_PRESETS.items()}
-        if not hasattr(self, "store"):
-            return {"ready": True, "presets": presets}
-        w = await self.store.get(WalletStore.GLOBAL_KEY)
-        has_activity = bool(w.trades or w.positions or w.shorts)
+        running = bool(self._replay_task and not self._replay_task.done())
         return {
-            "ready": True,   # 带策略回放空钱包也能跑；ready 只影响提示文案
-            "has_activity": has_activity,
+            "ready": not running,
+            "running": running,
             "presets": presets,
             "max_candles": int(self.config.task.replay_max_candles),
-            "hint": "" if has_activity else "钱包是空的：选好策略和金额即可回放，跑完即有成交与曲线",
+            "hint": "回放中：麦麦正在逐段行情自主交易，决策日志可见每一步" if running else "",
         }
 
     # ── 后台任务：爆仓检查 + 定投 + 快照 + 定期重测速 ──
@@ -888,9 +913,8 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
             "/coin                     资产总览",
             "/coin price BTC [ETH...]  实时价格 + 24h涨跌（支持中文币名）",
             "/coin funding [BTC]       当前资金费率（缺省=持仓币种）",
-            "/coin replay [币种] <时段> [策略 金额u]  历史回放：拨回过去重演行情",
-            "/coin replay BTC week dca 100u    例：回放一周，每日定投100U买入BTC",
-            "/coin replay BTC month hold 1000u 例：回放一月，期初一次性买入",
+            "/coin replay [币种] <时段>      历史回放：拨回过去，麦麦自主交易重演行情",
+            "/coin replay BTC week           例：回放最近一周，麦麦逐段行情自己决策买卖",
             "/coin replay ... until 2025-01-01 从指定日期回放（让麦麦经历那段市场）",
             "/coin buy BTC 100u        买入100U的BTC（或 /coin buy BTC 0.01 按数量）",
             "/coin sell BTC all        卖出（all=清仓，也可写数量）",
@@ -983,18 +1007,22 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
         return None
 
     async def _cmd_replay(self, stream_id: str, rest: List[str]) -> str:
-        """历史回放：/coin replay [币种] <预设> [dca|hold 金额u] [until 日期]
+        """历史回放：/coin replay [币种] [day|week|month|quarter|year] [until 日期]
+
+        把钱包拨回过去某个时点（重置到初始资金），麦麦逐根K线自主决策交易
+        （看行情趋势与自身持仓，决定 买/卖/开多/开空/平仓/不动），跑完后回到实时盘。
+
+        回放含多次 LLM 决策、耗时数分钟：命令立即返回，回放后台执行，
+        完成后主动发消息汇报；每一步决策与理由写入决策日志（WebUI 可查）。
 
         例：
-          /coin replay BTC week dca 100u     回放最近一周，每日定投 100 U 买入 BTC
-          /coin replay BTC month hold 1000u  回放最近一月，期初一次性买入 1000 U
-          /coin replay week                  不带策略=只重演已有持仓的风控（爆仓/止盈止损）
-          /coin replay BTC week dca 100u until 2025-01-01   从指定日期回放一周
-        带策略时钱包先重置到初始资金，回放产生真实成交与资产曲线，结束后回到实时盘。
+          /coin replay BTC week                      回放最近一周
+          /coin replay BTC month until 2025-01-01    从 2025-01-01 起回放一月
         """
         cfg = self.config
         w = await self.store.get(stream_id)
 
+        # ── 参数解析：[币种] [预设] [until 日期] ──
         until_ts: Optional[int] = None
         args = list(rest)
         if "until" in args:
@@ -1005,44 +1033,23 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
             if until_ts is None:
                 raise UserError(f"日期无效：{args[i + 1]}（格式 2025-01-01 或 2025-01-01 08:00）")
             args = args[:i] + args[i + 2:]
-        if not args:
-            raise UserError(
-                "用法：/coin replay [币种] <day|week|month|quarter|year> [dca|hold 金额u] [until 日期]\n"
-                "例：/coin replay BTC week dca 100u（每日定投）　/coin replay BTC month hold 1000u（一次性买入）\n"
-                "不带策略 = 只重演已有持仓的风控事件"
-            )
         symbol = ""
-        preset = args[0].lower()
-        if preset not in self._REPLAY_PRESETS:
-            # 第一个参数是币种，预设后移
-            symbol = normalize_symbol(args[0])
-            args = args[1:]
-            if not args:
-                raise UserError(f"缺少时段预设（{'/'.join(self._REPLAY_PRESETS)}），例：/coin replay {symbol} week dca 100u")
+        preset = ""
+        if args and args[0].lower() in self._REPLAY_PRESETS:
             preset = args[0].lower()
             args = args[1:]
-        if preset not in self._REPLAY_PRESETS:
-            raise UserError(f"未知预设：{preset}（可选 {'/'.join(self._REPLAY_PRESETS)}）")
-        interval, count = self._REPLAY_PRESETS[preset]
-        count = min(count, cfg.task.replay_max_candles)
-
-        # 策略解析（可选）
-        strategy, amount, is_usdt = "", 0.0, False
-        if args:
-            strategy = args[0].lower()
-            if strategy in STRATEGIES:
-                if len(args) < 2:
-                    raise UserError(f"策略 {strategy} 需要金额，例：dca 100u")
-                amount, is_usdt = parse_amount(args[1])
-                if amount is None or not is_usdt or amount <= 0:
-                    raise UserError(f"金额无效：{args[1]}（写 100u 这样的 USDT 金额）")
-                args = args[2:]
-            else:
-                raise UserError(f"未知策略：{args[0]}（可选 dca=每日定投 / hold=一次性买入；不带策略=只重演风控）")
+        elif args:
+            symbol = normalize_symbol(args[0])
+            args = args[1:]
+            if args and args[0].lower() in self._REPLAY_PRESETS:
+                preset = args[0].lower()
+                args = args[1:]
+        if not preset:
+            preset = "week"
         if args:
             raise UserError(f"多余参数：{' '.join(args)}")
-
-        # 回放币种：显式 > 持仓最大敞口 > BTC
+        interval, count = self._REPLAY_PRESETS[preset]
+        count = min(count, cfg.task.replay_max_candles)
         if not symbol:
             if w.positions:
                 symbol = max(w.positions, key=lambda s: w.positions[s]["qty"])
@@ -1051,81 +1058,132 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
             else:
                 symbol = "BTC"
 
-        # 带策略时重置钱包，从初始资金开始回放；否则要求钱包有内容可重演
-        if strategy:
-            reset = True
-        else:
-            if not w.trades and not w.positions and not w.shorts:
-                raise UserError(
-                    "钱包还是空的，回放无事可做。带个策略吧，例：/coin replay BTC week dca 100u"
-                )
-            reset = False
+        # ── 后台启动（回放含多次 LLM 决策，命令必须立即返回） ──
+        self._start_replay_job(stream_id, symbol, preset, until_ts)
+        return (
+            f"⏪ 历史回放开始：{symbol} {preset}（{interval}×{count}）\n"
+            "麦麦将逐段行情自主决策交易，预计几分钟，完成后我来汇报。\n"
+            "每一步决策与理由见 WebUI「决策日志」"
+        )
 
-        # 拉历史K线：endTime = until（缺省=现在）
+    def _start_replay_job(self, stream_id: str, symbol: str, preset: str, until_ts: Optional[int]) -> None:
+        """启动后台回放任务；已有回放在跑则抛 UserError（命令链转成用户报错）。"""
+        if self._replay_task and not self._replay_task.done():
+            raise UserError("已有一次回放在跑，等它结束再开新的（决策日志可见进度）")
+        self._replay_task = asyncio.get_running_loop().create_task(
+            self._run_replay_job(stream_id, symbol, preset, until_ts)
+        )
+        self._replay_task.add_done_callback(self._replay_done)
+
+    async def _run_replay_job(self, stream_id: str, symbol: str, preset: str, until_ts: Optional[int]) -> None:
+        """后台执行历史回放：拉K线 → 麦麦逐段决策 → 风控重演 → 主动汇报。"""
+        cfg = self.config
+        w = await self.store.get(stream_id)
+        interval, count = self._REPLAY_PRESETS[preset]
+        count = min(count, cfg.task.replay_max_candles)
+
+        # ── 拉历史K线 ──
         import time as _time
         end_ms = (until_ts if until_ts else int(_time.time())) * 1000
         try:
             candles = await self.market.get_klines_history(symbol, interval, end_ms, limit=count + 1)
         except Exception as e:  # noqa: BLE001
-            raise UserError(f"历史K线拉取失败：{e}") from e
+            await self.journal.log("system", "历史回放中止", detail=f"历史K线拉取失败：{e}")
+            return
         if len(candles) < 2:
-            raise UserError("该时段历史K线不足")
+            await self.journal.log("system", "历史回放中止", detail="该时段历史K线不足")
+            return
         start_dt = candles[0].ts
         end_dt = candles[-1].ts
 
+        # ── 构建麦麦决策回调（LLM 自主交易） ──
+        import datetime as _dt
+
+        def _ts_local(ts: int) -> str:
+            return _dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
         engine = ReplayEngine(
-            w, fee_rate=cfg.trading.spot_fee if strategy else cfg.trading.futures_fee,
+            w,
+            fee_rate=cfg.trading.spot_fee,
+            futures_fee=cfg.trading.futures_fee,
             funding_default=cfg.trading.funding_default,
             mmr=cfg.trading.maintenance_margin_rate,
+            max_decisions=max(1, cfg.task.replay_max_decisions),
         )
 
+        async def decide(c: Candle, closes: List[float], seq: int) -> Optional[Tuple[str, List[str], str]]:
+            """问麦麦当前这根K线怎么操作。返回 (action, args, reasoning)。"""
+            prompt = engine.build_prompt(symbol, c, closes, interval, _ts_local(c.ts), getattr(engine, "_last_action_desc", ""))
+            try:
+                result = await self.ctx.llm.generate(prompt=prompt)
+            except Exception as e:  # noqa: BLE001
+                await self.journal.log("system", f"回放决策调用失败 #{seq + 1}", detail=f"{type(e).__name__}: {e}")
+                return None
+            if not result.get("success"):
+                return None
+            text = str(result.get("response") or "")
+            reasoning = str(result.get("reasoning") or "")
+            parsed = parse_free_action(text)
+            if not parsed:
+                await self.journal.log(
+                    "llm", f"回放决策 #{seq + 1}（{_ts_local(c.ts)}）",
+                    reasoning=reasoning[:800], detail=f"输出无法解析：{text[:200]}", meta={"ok": False},
+                )
+                return None
+            action, pargs = parsed
+            # 引擎收到返回值后会执行指令；这里只负责把决策写进日志（不执行，防止重复成交）
+            await self.journal.log(
+                "llm", f"回放决策 #{seq + 1}（{_ts_local(c.ts)}）",
+                reasoning=reasoning[:800],
+                detail=f"指令：{action}{' ' + ' '.join(pargs) if pargs else ''}",
+                meta={"ok": True},
+            )
+            return (action, pargs, reasoning)
+
+        # ── 执行回放（LLM 逐段决策，可能耗时数分钟） ──
         async def on_event(text: str) -> None:
-            if hasattr(self, "journal"):
-                await self.journal.log("system", "历史回放事件", detail=text[:500])
+            await self.journal.log("system", "历史回放事件", detail=text[:500])
 
         res: ReplayResult = await engine.run(
-            candles, symbol, interval, on_event=on_event,
-            strategy=strategy, strategy_amount=amount, reset_wallet=reset,
+            candles, symbol, interval, on_event=on_event, decide=decide, reset_wallet=True,
         )
 
-        # 回放产生的快照与成交保留（历史时间戳）；保存钱包
         await self.store.save(w)
-        strat_desc = (
-            f"{strategy.upper()}×{res.strategy_trades} 笔投入 {res.strategy_cost:,.0f} U"
-            if strategy else "纯风控重演（无新交易）"
-        )
+        hold_desc = engine._fmt_spot() or "空仓"
         await self.journal.log(
             "system",
-            f"历史回放 {symbol} {preset}（{fmt_ts(start_dt)} → {fmt_ts(end_dt)}）",
+            f"历史回放结束 {symbol} {preset}（{fmt_ts(start_dt)} → {fmt_ts(end_dt)}）",
             detail=(
-                f"K线 {res.candles} 根；策略 {strat_desc}；爆仓 {res.liquidations}、"
-                f"止盈止损 {res.tp_sl_hits}、资金费 {res.fundings} 次；"
-                f"资产 {res.value_before:,.0f} → {res.value_after:,.0f} U"
+                f"K线 {res.candles} 根；麦麦决策 {res.decisions} 次（发动作 {res.acted}、无效 {res.errors}）；"
+                f"成交 {res.trades} 笔；爆仓 {res.liquidations}、止盈止损 {res.tp_sl_hits}；"
+                f"资产 {res.value_before:,.0f} → {res.value_after:,.0f} U（{fmt_pct(res.pnl_pct)}）；"
+                f"期末 {hold_desc}"
             ),
         )
 
-        import datetime
-        s_dt = datetime.datetime.fromtimestamp(start_dt).strftime("%m-%d")
-        e_dt = datetime.datetime.fromtimestamp(end_dt).strftime("%m-%d")
+        # ── 汇报 ──
+        s_dt = _dt.datetime.fromtimestamp(start_dt).strftime("%m-%d %H:%M")
+        e_dt = _dt.datetime.fromtimestamp(end_dt).strftime("%m-%d %H:%M")
         chg = (res.end_price / res.start_price - 1) * 100
-        lines = [
+        lines_out = [
             f"🎬 历史回放完成 {symbol}（{s_dt} → {e_dt}，{interval}×{res.candles}）",
             f"行情：{fmt_price(res.start_price)} → {fmt_price(res.end_price)}（{fmt_pct(chg)}）",
+            f"麦麦：决策 {res.decisions} 次（下单 {res.acted}、无效 {res.errors}）· 成交 {res.trades} 笔",
+            f"事件：💥爆仓 {res.liquidations}　🎯止盈止损 {res.tp_sl_hits}　💸资金费 {res.fundings}",
+            f"资产：{res.value_before:,.2f} → {res.value_after:,.2f} U（{fmt_pct(res.pnl_pct)}）",
+            f"期末：{hold_desc}｜现金 {w.cash:,.2f} U",
+            "⏰ 已回到实时盘。每一步决策与理由见 WebUI「决策日志」",
         ]
-        if strategy:
-            pos = w.positions.get(symbol)
-            hold = f"，现持 {fmt_qty(pos['qty'])} {symbol}" if pos else ""
-            ret = (res.value_after / res.strategy_cost - 1) * 100 if res.strategy_cost else 0.0
-            lines.append(f"策略：{strategy.upper()} {res.strategy_trades} 笔投入 {res.strategy_cost:,.2f} U → 现值 {res.value_after:,.2f} U（{fmt_pct(ret)}）{hold}")
-        lines.append(f"事件：💥爆仓 {res.liquidations}　🎯止盈止损 {res.tp_sl_hits}　💸资金费 {res.fundings}")
-        lines.append(f"资产：{res.value_before:,.2f} → {res.value_after:,.2f} U（{fmt_pct(res.pnl_pct)}）")
-        lines.append("⏰ 已回到实时盘，用 /coin 看当前持仓")
-        for n in res.notes[-5:]:
-            lines.append(f"· {n}")
-        if len(res.notes) > 5:
-            lines.append(f"…（共 {len(res.notes)} 条事件，WebUI 决策日志可查全部）")
-        return "\n".join(lines)
-
+        for n in res.notes[-6:]:
+            lines_out.append(f"· {n}")
+        if len(res.notes) > 6:
+            lines_out.append(f"…（共 {len(res.notes)} 条事件）")
+        report = "\n".join(lines_out)
+        # 后台任务无法把返回值交回命令链：主动发送到触发回放的聊天流
+        try:
+            await self.ctx.send.text(report, stream_id)
+        except Exception as e:  # noqa: BLE001
+            self.ctx.logger.warning("回放汇报发送失败（stream=%s）：%s", stream_id, e)
     async def _cmd_buy(self, stream_id: str, rest: List[str]) -> str:
         if len(rest) < 2:
             raise UserError("用法：/coin buy <币种> <数量|金额u>  例：/coin buy BTC 500u")

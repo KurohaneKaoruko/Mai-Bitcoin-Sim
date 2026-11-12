@@ -317,19 +317,33 @@ check("sparkline", len(sparkline([1, 2, 3, 4])) == 4)
 
 # ─── 回放引擎 ───
 print("[回放引擎]")
-from core.replay import ReplayEngine, _candle_extremes, MAX_CANDLES
+from core.replay import ReplayEngine, _candle_extremes, parse_free_action, FREE_ACTIONS
 
 seq = _candle_extremes(Candle(0, 100, 110, 90, 105, 1))
 check("K线暴露顺序含首尾", seq[0] == 100 and seq[-1] == 105 and 90 in seq and 110 in seq)
 check("暴露顺序扫到两影线", abs(seq.index(90) - seq.index(110)) >= 1)
 
+# 指令解析
+pa = parse_free_action("buy 500")
+check("解析 buy", pa is not None and pa[0] == "buy" and pa[1] == ["500"], str(pa))
+pa = parse_free_action("我决定：sell all。")
+check("解析带前缀标点 sell all", pa is not None and pa[0] == "sell" and pa[1] == ["all"], str(pa))
+pa = parse_free_action("Hold")
+check("解析大小写 hold", pa is not None and pa[0] == "hold")
+pa = parse_free_action("long 300 5x")
+check("解析 long 带杠杆", pa is not None and pa[0] == "long" and pa[1] == ["300", "5x"], str(pa))
+pa = parse_free_action("今天天气不错")
+check("无法解析返回 None", pa is None)
+pa = parse_free_action("先观察一下。hold")
+check("多行取到有效动作", pa is not None and pa[0] == "hold", str(pa))
+
 async def _replay_tests():
-    # 空单在回放中爆仓
+    # 空单在回放中爆仓（decide=None，纯风控模式仍可用）
     w = Wallet("t", 10000.0)
     w.open_short("BTC", 0.5, 10.0, 100.0, 0.0005, 0.005)
-    eng = ReplayEngine(w, 0.0005, 0.0001)
+    eng = ReplayEngine(w, 0.001, 0.0005, 0.0001)
     candles = [Candle(1000, 100, 105, 99, 104, 1), Candle(4600, 104, 111, 103, 110, 1), Candle(8200, 110, 112, 108, 109, 1)]
-    res = await eng.run(candles, "BTC", "1h")
+    res = await eng.run(candles, "BTC", "1h", decide=None, reset_wallet=False)
     check("回放触发爆仓", res.liquidations == 1 and not w.shorts)
     check("回放摘要字段", res.candles == 3 and res.start_price == 100 and res.end_price == 109)
     check("回放曲线非空", len(res.curve) >= 2 and approx(res.curve[-1][1], res.value_after, 1e-6))
@@ -338,55 +352,62 @@ async def _replay_tests():
     w2 = Wallet("t2", 10000.0)
     w2.buy("BTC", 5000, 100.0, 0.001)
     w2.set_tp_sl("BTC", tp=108.0)
-    eng2 = ReplayEngine(w2, 0.001, 0.0001)
+    eng2 = ReplayEngine(w2, 0.001, 0.0005, 0.0001)
     candles2 = [Candle(1000, 100, 103, 99, 102, 1), Candle(4600, 102, 109, 101, 108.5, 1), Candle(8200, 108, 111, 107, 110, 1)]
-    res2 = await eng2.run(candles2, "BTC", "1h")
+    res2 = await eng2.run(candles2, "BTC", "1h", decide=None, reset_wallet=False)
     check("回放触发止盈", res2.tp_sl_hits == 1 and "BTC" not in w2.positions, str(res2.notes))
 
     # 资金费按周期结算
     w3 = Wallet("t3", 10000.0)
     w3.open_long("BTC", 0.3, 5.0, 100.0, 0.0005, 0.005)
-    eng3 = ReplayEngine(w3, 0.0005, 0.0001)
+    eng3 = ReplayEngine(w3, 0.001, 0.0005, 0.0001)
     long_candles = [Candle(1000 + i * 3600, 100, 101, 99, 100, 1) for i in range(30)]
-    res3 = await eng3.run(long_candles, "BTC", "1h")
+    res3 = await eng3.run(long_candles, "BTC", "1h", decide=None, reset_wallet=False)
     check("回放结算资金费", res3.fundings >= 1 and w3.funding_total > 0, f"{res3.fundings} 次")
     check("回放多单存活", "BTC|L" in w3.shorts)
 
-    # DCA 策略：空钱包回放产生真实成交（每日定投）
+    # 麦麦自主决策：脚本化 decide 回调模拟她的指令
     w4 = Wallet("t4", 1000.0)
-    eng4 = ReplayEngine(w4, 0.001, 0.0001)
-    # 3 天、每天 3 根 1h K线（ts 从 86400*10 开始，整日边界好数）
+    eng4 = ReplayEngine(w4, 0.001, 0.0005, 0.0001, max_decisions=48)
     base = 86400 * 10
-    dca_candles = [Candle(base + d * 86400 + h * 3600, 100 + d, 101 + d, 99 + d, 100 + d, 1)
-                   for d in range(3) for h in range(3)]
-    res4 = await eng4.run(dca_candles, "BTC", "1h", strategy="dca", strategy_amount=100.0, reset_wallet=True)
-    check("DCA 每日一买", res4.strategy_trades == 3, f"{res4.strategy_trades} 笔")
-    check("DCA 产生持仓", "BTC" in w4.positions and w4.positions["BTC"]["qty"] > 0)
-    check("DCA 扣款正确", approx(w4.cash, 1000 - 300 - res4.strategy_cost + 300, 1e-6) or w4.cash < 700)
-    check("DCA 成交带历史时间戳", w4.trades and w4.trades[-1].ts == dca_candles[-3].ts,
-          f"末笔 ts={w4.trades[-1].ts} 期望={dca_candles[-3].ts}")
-    check("DCA 曲线写入钱包", len(w4.snapshots) >= 3 and w4.snapshots[0][0] == base)
-    check("DCA 回放后资产=现金+持仓市值", approx(res4.value_after, w4.total_value({"BTC": dca_candles[-1].close}), 1e-6))
+    # 3 天、每天 2 根；第 0 根买入、第 2 根开多、第 4 根平多
+    script = [(0, "buy", ["400"]), (2, "long", ["200", "5x"]), (4, "close", ["long"])]
+    async def decide4(c, closes, seq_no):
+        for at, act, pargs in script:
+            if seq_no == len([s for s in script if s[0] < at]) and False:
+                pass
+        # 按 idx 匹配：decide 收到 c，用 c.ts 找
+        idx = (c.ts - base) // 3600
+        for at, act, pargs in script:
+            if idx == at:
+                return act, pargs, "测试理由"
+        return "hold", [], "观望"
+    free_candles = [Candle(base + i * 3600, 100 + i, 101 + i, 99 + i, 100 + i, 1) for i in range(6)]
+    res4 = await eng4.run(free_candles, "BTC", "1h", decide=decide4, reset_wallet=True)
+    check("自主决策执行买入", "BTC" in w4.positions, str(w4.positions))
+    check("自主决策开平合约", res4.acted == 3, f"acted={res4.acted}")
+    check("自主决策成交计数", res4.trades >= 3, f"trades={res4.trades}")
+    check("重置后从初始资金开始", res4.value_before == 1000.0, str(res4.value_before))
+    check("曲线写入钱包", len(w4.snapshots) >= 4 and w4.snapshots[0][0] == base)
 
-    # HOLD 策略：首根一次性买入
+    # 无效指令容错
     w5 = Wallet("t5", 1000.0)
-    eng5 = ReplayEngine(w5, 0.001, 0.0001)
-    res5 = await eng5.run(dca_candles, "BTC", "1h", strategy="hold", strategy_amount=500.0, reset_wallet=True)
-    check("HOLD 只买一次", res5.strategy_trades == 1 and len([t for t in w5.trades if t.note.startswith("replay")]) == 1)
+    eng5 = ReplayEngine(w5, 0.001, 0.0005, 0.0001)
+    async def decide5(c, closes, seq_no):
+        if seq_no == 0:
+            return "sell", ["all"], "想卖但没持仓"
+        return "hold", [], ""
+    res5 = await eng5.run(free_candles, "BTC", "1h", decide=decide5, reset_wallet=True)
+    check("无效指令计错误", res5.errors == 1, f"errors={res5.errors}")
 
-    # 重置回放：旧持仓被清空
-    w6 = Wallet("t6", 10000.0)
-    w6.buy("ETH", 2000, 50.0, 0.001)
-    eng6 = ReplayEngine(w6, 0.001, 0.0001)
-    await eng6.run(dca_candles, "BTC", "1h", strategy="dca", strategy_amount=100.0, reset_wallet=True)
-    check("重置清掉旧持仓", "ETH" not in w6.positions)
-
-    # 非法策略
-    try:
-        await ReplayEngine(Wallet("t7", 100.0), 0.001, 0.0001).run(dca_candles, "BTC", "1h", strategy="moon")
-        check("非法策略拒绝", False)
-    except ValueError:
-        check("非法策略拒绝", True)
+    # 决策节流：max_decisions=2 → 6 根K线每 3 根决策一次
+    calls = {"n": 0}
+    async def decide6(c, closes, seq_no):
+        calls["n"] += 1
+        return "hold", [], ""
+    eng6 = ReplayEngine(Wallet("t6", 1000.0), 0.001, 0.0005, 0.0001, max_decisions=2)
+    await eng6.run(free_candles, "BTC", "1h", decide=decide6, reset_wallet=True)
+    check("决策节流生效", calls["n"] == 2, f"calls={calls['n']}")
 
 asyncio.run(_replay_tests())
 

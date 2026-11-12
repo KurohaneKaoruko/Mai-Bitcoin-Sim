@@ -67,21 +67,6 @@
               "required": false,
               "max_length": 10
             },
-            "strategy": {
-              "type": "string",
-              "required": false,
-              "choices": [
-                "dca",
-                "hold",
-                "none"
-              ]
-            },
-            "amount": {
-              "type": "number",
-              "required": false,
-              "minimum": 1,
-              "maximum": 1000000
-            },
             "until": {
               "type": "string",
               "required": false,
@@ -365,7 +350,7 @@
           "children": [
             {
               "type": "input",
-              "name": "r_symbol",
+              "name": "symbol",
               "label": "回放币种",
               "value": "BTC"
             },
@@ -396,32 +381,6 @@
                   "value": "year"
                 }
               ]
-            },
-            {
-              "type": "select",
-              "name": "strategy",
-              "label": "策略",
-              "value": "dca",
-              "options": [
-                {
-                  "label": "每日定投 DCA",
-                  "value": "dca"
-                },
-                {
-                  "label": "一次性买入 HOLD",
-                  "value": "hold"
-                },
-                {
-                  "label": "不交易（只重演风控）",
-                  "value": "none"
-                }
-              ]
-            },
-            {
-              "type": "input",
-              "name": "r_amount",
-              "label": "单次金额 (USDT)",
-              "value": 100
             },
             {
               "type": "date",
