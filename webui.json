@@ -7,9 +7,10 @@
     {
       "id": "dashboard",
       "title": "炒币模拟器",
-      "description": "模拟钱包投资仪表盘：资产总览、持仓、合约、成交与资产曲线",
+      "description": "模拟钱包投资仪表盘：资产、持仓、合约、成交、资产曲线、历史回放与决策日志",
       "icon": "chart",
       "mode": "declarative",
+      "auto_refresh": true,
       "poll_interval_seconds": 30,
       "queries": {
         "dash": {
@@ -31,7 +32,7 @@
               "type": "string",
               "required": false,
               "choices": [
-                "",
+                "all",
                 "llm",
                 "command",
                 "system"
@@ -77,520 +78,419 @@
       },
       "content": [
         {
-          "type": "text",
-          "value": {
-            "source": "dash",
-            "field": "updated_at"
-          },
-          "label": "数据时间"
-        },
-        {
-          "type": "grid",
-          "columns": 4,
-          "label": "资产总览",
+          "type": "tabs",
           "children": [
             {
-              "type": "stat",
-              "label": "总资产 (USDT)",
-              "value": {
-                "source": "dash",
-                "field": "overview.total"
-              }
-            },
-            {
-              "type": "stat",
-              "label": "总盈亏 (USDT)",
-              "value": {
-                "source": "dash",
-                "field": "overview.pnl"
-              }
-            },
-            {
-              "type": "stat",
-              "label": "收益率",
-              "value": {
-                "source": "dash",
-                "field": "overview.pnl_pct"
-              }
-            },
-            {
-              "type": "stat",
-              "label": "可用现金",
-              "value": {
-                "source": "dash",
-                "field": "overview.cash"
-              }
-            }
-          ]
-        },
-        {
-          "type": "grid",
-          "columns": 4,
-          "label": "资金构成",
-          "children": [
-            {
-              "type": "stat",
-              "label": "现货市值",
-              "value": {
-                "source": "dash",
-                "field": "overview.spot_value"
-              }
-            },
-            {
-              "type": "stat",
-              "label": "现货浮盈",
-              "value": {
-                "source": "dash",
-                "field": "overview.spot_upnl"
-              }
-            },
-            {
-              "type": "stat",
-              "label": "合约保证金",
-              "value": {
-                "source": "dash",
-                "field": "overview.margin"
-              }
-            },
-            {
-              "type": "stat",
-              "label": "合约浮盈",
-              "value": {
-                "source": "dash",
-                "field": "overview.fut_upnl"
-              }
-            },
-            {
-              "type": "stat",
-              "label": "已实现盈亏",
-              "value": {
-                "source": "dash",
-                "field": "overview.realized_pnl"
-              }
-            }
-          ]
-        },
-        {
-          "type": "chart",
-          "label": "资产曲线 (USDT)",
-          "value": {
-            "source": "dash",
-            "field": "curve"
-          },
-          "chart_type": "line",
-          "x": "t",
-          "y": "v"
-        },
-        {
-          "type": "table",
-          "label": "现货持仓",
-          "value": {
-            "source": "dash",
-            "field": "spot"
-          },
-          "columns": [
-            {
-              "field": "symbol",
-              "label": "币种"
-            },
-            {
-              "field": "qty",
-              "label": "数量"
-            },
-            {
-              "field": "avg_cost",
-              "label": "成本"
-            },
-            {
-              "field": "price",
-              "label": "现价"
-            },
-            {
-              "field": "value",
-              "label": "市值"
-            },
-            {
-              "field": "upnl",
-              "label": "浮盈"
-            },
-            {
-              "field": "upnl_pct",
-              "label": "浮盈%"
-            },
-            {
-              "field": "tp",
-              "label": "止盈"
-            },
-            {
-              "field": "sl",
-              "label": "止损"
-            }
-          ]
-        },
-        {
-          "type": "table",
-          "label": "合约仓位",
-          "value": {
-            "source": "dash",
-            "field": "futures"
-          },
-          "columns": [
-            {
-              "field": "symbol",
-              "label": "币种"
-            },
-            {
-              "field": "side",
-              "label": "方向"
-            },
-            {
-              "field": "qty",
-              "label": "数量"
-            },
-            {
-              "field": "leverage",
-              "label": "杠杆"
-            },
-            {
-              "field": "entry",
-              "label": "开仓价"
-            },
-            {
-              "field": "price",
-              "label": "标记价"
-            },
-            {
-              "field": "liq",
-              "label": "爆仓价"
-            },
-            {
-              "field": "margin",
-              "label": "保证金"
-            },
-            {
-              "field": "upnl",
-              "label": "浮盈"
-            },
-            {
-              "field": "upnl_pct",
-              "label": "收益率%"
-            },
-            {
-              "field": "tp",
-              "label": "止盈"
-            },
-            {
-              "field": "sl",
-              "label": "止损"
-            }
-          ]
-        },
-        {
-          "type": "table",
-          "label": "最近成交",
-          "value": {
-            "source": "dash",
-            "field": "trades"
-          },
-          "columns": [
-            {
-              "field": "time",
-              "label": "时间"
-            },
-            {
-              "field": "action",
-              "label": "操作"
-            },
-            {
-              "field": "symbol",
-              "label": "币种"
-            },
-            {
-              "field": "qty",
-              "label": "数量"
-            },
-            {
-              "field": "price",
-              "label": "价格"
-            },
-            {
-              "field": "amount",
-              "label": "金额"
-            },
-            {
-              "field": "pnl",
-              "label": "盈亏"
-            }
-          ]
-        },
-        {
-          "type": "grid",
-          "columns": 3,
-          "label": "决策日志概览",
-          "children": [
-            {
-              "type": "stat",
-              "label": "LLM 决策次数",
-              "value": {
-                "source": "journal",
-                "field": "counts.llm"
-              }
-            },
-            {
-              "type": "stat",
-              "label": "命令调用次数",
-              "value": {
-                "source": "journal",
-                "field": "counts.command"
-              }
-            },
-            {
-              "type": "stat",
-              "label": "后台事件次数",
-              "value": {
-                "source": "journal",
-                "field": "counts.system"
-              }
-            }
-          ]
-        },
-        {
-          "type": "table",
-          "label": "最近 LLM 决策",
-          "value": {
-            "source": "journal",
-            "field": "entries"
-          },
-          "selection": "dec",
-          "detail": "dec_detail",
-          "columns": [
-            {
-              "field": "time",
-              "label": "时间"
-            },
-            {
-              "field": "kind",
-              "label": "类型"
-            },
-            {
-              "field": "title",
-              "label": "动作"
-            },
-            {
-              "field": "detail",
-              "label": "结果"
-            }
-          ]
-        },
-        {
-          "type": "dialog",
-          "name": "dec_detail",
-          "label": "决策详情",
-          "children": [
-            {
-              "type": "text",
-              "label": "时间",
-              "value": {
-                "source": "dec",
-                "field": "time",
-                "scope": "selection"
-              }
-            },
-            {
-              "type": "text",
-              "label": "动作",
-              "value": {
-                "source": "dec",
-                "field": "title",
-                "scope": "selection"
-              }
-            },
-            {
-              "type": "text",
-              "label": "LLM 思考",
-              "value": {
-                "source": "dec",
-                "field": "reasoning",
-                "scope": "selection"
-              }
-            },
-            {
-              "type": "text",
-              "label": "结果",
-              "value": {
-                "source": "dec",
-                "field": "detail",
-                "scope": "selection"
-              }
-            }
-          ]
-        },
-        {
-          "type": "grid",
-          "columns": 3,
-          "label": "快捷操作",
-          "children": [
-            {
-              "type": "select",
-              "name": "preset",
-              "label": "回放时段",
-              "value": "week",
-              "options": [
+              "type": "stack",
+              "label": "行情与持仓",
+              "children": [
                 {
-                  "label": "最近1天（1h×24）",
-                  "value": "day"
+                  "type": "text",
+                  "label": "数据时间",
+                  "value": {
+                    "source": "dash",
+                    "field": "updated_at",
+                    "scope": "query"
+                  }
                 },
                 {
-                  "label": "最近1周（1h×168）",
-                  "value": "week"
+                  "type": "grid",
+                  "columns": 4,
+                  "label": "资产总览",
+                  "children": [
+                    {
+                      "type": "stat",
+                      "label": "总资产 (USDT)",
+                      "value": {
+                        "source": "dash",
+                        "field": "overview.total",
+                        "scope": "query"
+                      }
+                    },
+                    {
+                      "type": "stat",
+                      "label": "总盈亏 (USDT)",
+                      "value": {
+                        "source": "dash",
+                        "field": "overview.pnl",
+                        "scope": "query"
+                      }
+                    },
+                    {
+                      "type": "stat",
+                      "label": "收益率",
+                      "value": {
+                        "source": "dash",
+                        "field": "overview.pnl_pct",
+                        "scope": "query"
+                      }
+                    },
+                    {
+                      "type": "stat",
+                      "label": "可用现金",
+                      "value": {
+                        "source": "dash",
+                        "field": "overview.cash",
+                        "scope": "query"
+                      }
+                    }
+                  ]
                 },
                 {
-                  "label": "最近1月（4h×180）",
-                  "value": "month"
+                  "type": "grid",
+                  "columns": 4,
+                  "label": "资金构成",
+                  "children": [
+                    {
+                      "type": "stat",
+                      "label": "现货市值",
+                      "value": {
+                        "source": "dash",
+                        "field": "overview.spot_value",
+                        "scope": "query"
+                      }
+                    },
+                    {
+                      "type": "stat",
+                      "label": "现货浮盈",
+                      "value": {
+                        "source": "dash",
+                        "field": "overview.spot_upnl",
+                        "scope": "query"
+                      }
+                    },
+                    {
+                      "type": "stat",
+                      "label": "合约保证金",
+                      "value": {
+                        "source": "dash",
+                        "field": "overview.margin",
+                        "scope": "query"
+                      }
+                    },
+                    {
+                      "type": "stat",
+                      "label": "合约浮盈",
+                      "value": {
+                        "source": "dash",
+                        "field": "overview.fut_upnl",
+                        "scope": "query"
+                      }
+                    },
+                    {
+                      "type": "stat",
+                      "label": "已实现盈亏",
+                      "value": {
+                        "source": "dash",
+                        "field": "overview.realized_pnl",
+                        "scope": "query"
+                      }
+                    }
+                  ]
                 },
                 {
-                  "label": "最近1季（4h×540）",
-                  "value": "quarter"
+                  "type": "chart",
+                  "label": "资产曲线 (USDT)",
+                  "value": {
+                    "source": "dash",
+                    "field": "curve",
+                    "scope": "query"
+                  },
+                  "chart_type": "line",
+                  "x": "t",
+                  "y": "v"
                 },
                 {
-                  "label": "最近1年（1d×365）",
-                  "value": "year"
+                  "type": "table",
+                  "label": "现货持仓",
+                  "value": {
+                    "source": "dash",
+                    "field": "spot",
+                    "scope": "query"
+                  },
+                  "columns": [
+                    {
+                      "field": "symbol",
+                      "label": "币种"
+                    },
+                    {
+                      "field": "qty",
+                      "label": "数量"
+                    },
+                    {
+                      "field": "avg_cost",
+                      "label": "成本"
+                    },
+                    {
+                      "field": "price",
+                      "label": "现价"
+                    },
+                    {
+                      "field": "value",
+                      "label": "市值"
+                    },
+                    {
+                      "field": "upnl",
+                      "label": "浮盈"
+                    },
+                    {
+                      "field": "upnl_pct",
+                      "label": "浮盈%"
+                    },
+                    {
+                      "field": "tp",
+                      "label": "止盈"
+                    },
+                    {
+                      "field": "sl",
+                      "label": "止损"
+                    }
+                  ]
+                },
+                {
+                  "type": "table",
+                  "label": "合约仓位",
+                  "value": {
+                    "source": "dash",
+                    "field": "futures",
+                    "scope": "query"
+                  },
+                  "columns": [
+                    {
+                      "field": "symbol",
+                      "label": "币种"
+                    },
+                    {
+                      "field": "side",
+                      "label": "方向"
+                    },
+                    {
+                      "field": "qty",
+                      "label": "数量"
+                    },
+                    {
+                      "field": "leverage",
+                      "label": "杠杆"
+                    },
+                    {
+                      "field": "entry",
+                      "label": "开仓价"
+                    },
+                    {
+                      "field": "price",
+                      "label": "标记价"
+                    },
+                    {
+                      "field": "liq",
+                      "label": "爆仓价"
+                    },
+                    {
+                      "field": "margin",
+                      "label": "保证金"
+                    },
+                    {
+                      "field": "upnl",
+                      "label": "浮盈"
+                    },
+                    {
+                      "field": "upnl_pct",
+                      "label": "收益率%"
+                    },
+                    {
+                      "field": "tp",
+                      "label": "止盈"
+                    },
+                    {
+                      "field": "sl",
+                      "label": "止损"
+                    }
+                  ]
+                },
+                {
+                  "type": "table",
+                  "label": "最近成交",
+                  "value": {
+                    "source": "dash",
+                    "field": "trades",
+                    "scope": "query"
+                  },
+                  "columns": [
+                    {
+                      "field": "time",
+                      "label": "时间"
+                    },
+                    {
+                      "field": "action",
+                      "label": "操作"
+                    },
+                    {
+                      "field": "symbol",
+                      "label": "币种"
+                    },
+                    {
+                      "field": "qty",
+                      "label": "数量"
+                    },
+                    {
+                      "field": "price",
+                      "label": "价格"
+                    },
+                    {
+                      "field": "amount",
+                      "label": "金额"
+                    },
+                    {
+                      "field": "pnl",
+                      "label": "盈亏"
+                    }
+                  ]
+                },
+                {
+                  "type": "grid",
+                  "columns": 4,
+                  "label": "快捷操作",
+                  "children": [
+                    {
+                      "type": "select",
+                      "name": "preset",
+                      "label": "回放时段",
+                      "value": "week",
+                      "options": [
+                        {
+                          "label": "最近1天（1h×24）",
+                          "value": "day"
+                        },
+                        {
+                          "label": "最近1周（1h×168）",
+                          "value": "week"
+                        },
+                        {
+                          "label": "最近1月（4h×180）",
+                          "value": "month"
+                        },
+                        {
+                          "label": "最近1季（4h×540）",
+                          "value": "quarter"
+                        },
+                        {
+                          "label": "最近1年（1d×365）",
+                          "value": "year"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "date",
+                      "name": "until",
+                      "label": "回放截止日（可选）"
+                    },
+                    {
+                      "type": "button",
+                      "label": "🎬 开始历史回放",
+                      "action": "do_replay",
+                      "variant": "primary"
+                    },
+                    {
+                      "type": "button",
+                      "label": "🔄 重置钱包",
+                      "action": "do_reset",
+                      "variant": "danger"
+                    }
+                  ]
                 }
               ]
             },
             {
-              "type": "button",
-              "label": "🎬 开始历史回放",
-              "action": "do_replay",
-              "variant": "primary"
-            },
-            {
-              "type": "button",
-              "label": "🔄 重置钱包",
-              "action": "do_reset",
-              "variant": "danger"
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "id": "journal",
-      "title": "炒币决策日志",
-      "description": "LLM 决策思考、命令调用与后台事件全记录",
-      "icon": "list",
-      "mode": "declarative",
-      "poll_interval_seconds": 30,
-      "queries": {
-        "log": {
-          "api": "get_journal",
-          "version": "1",
-          "parameters": {
-            "limit": {
-              "type": "integer",
-              "required": false,
-              "minimum": 1,
-              "maximum": 200
-            },
-            "kind": {
-              "type": "string",
-              "required": false,
-              "choices": [
-                "",
-                "llm",
-                "command",
-                "system"
+              "type": "stack",
+              "label": "决策日志",
+              "children": [
+                {
+                  "type": "grid",
+                  "columns": 3,
+                  "label": "统计",
+                  "children": [
+                    {
+                      "type": "stat",
+                      "label": "LLM 决策",
+                      "value": {
+                        "source": "journal",
+                        "field": "counts.llm",
+                        "scope": "query"
+                      }
+                    },
+                    {
+                      "type": "stat",
+                      "label": "命令调用",
+                      "value": {
+                        "source": "journal",
+                        "field": "counts.command",
+                        "scope": "query"
+                      }
+                    },
+                    {
+                      "type": "stat",
+                      "label": "后台事件",
+                      "value": {
+                        "source": "journal",
+                        "field": "counts.system",
+                        "scope": "query"
+                      }
+                    }
+                  ]
+                },
+                {
+                  "type": "select",
+                  "name": "kind",
+                  "label": "类型筛选（选择即刷新）",
+                  "value": "all",
+                  "options": [
+                    {
+                      "label": "全部",
+                      "value": "all"
+                    },
+                    {
+                      "label": "LLM 决策",
+                      "value": "llm"
+                    },
+                    {
+                      "label": "命令调用",
+                      "value": "command"
+                    },
+                    {
+                      "label": "后台事件",
+                      "value": "system"
+                    }
+                  ]
+                },
+                {
+                  "type": "table",
+                  "label": "事件流水",
+                  "value": {
+                    "source": "journal",
+                    "field": "entries",
+                    "scope": "query"
+                  },
+                  "selection": "ev",
+                  "detail": "ev_detail",
+                  "columns": [
+                    {
+                      "field": "time",
+                      "label": "时间"
+                    },
+                    {
+                      "field": "kind",
+                      "label": "类型"
+                    },
+                    {
+                      "field": "title",
+                      "label": "事件"
+                    },
+                    {
+                      "field": "detail",
+                      "label": "内容"
+                    }
+                  ]
+                }
               ]
-            }
-          }
-        }
-      },
-      "actions": {
-        "refresh_log": {
-          "api": "get_journal",
-          "version": "1",
-          "parameters": {
-            "limit": {
-              "type": "integer",
-              "required": false,
-              "minimum": 1,
-              "maximum": 200
-            },
-            "kind": {
-              "type": "string",
-              "required": false,
-              "choices": [
-                "",
-                "llm",
-                "command",
-                "system"
-              ]
-            }
-          }
-        }
-      },
-      "content": [
-        {
-          "type": "grid",
-          "columns": 3,
-          "label": "统计",
-          "children": [
-            {
-              "type": "stat",
-              "label": "LLM 决策",
-              "value": {
-                "source": "log",
-                "field": "counts.llm"
-              }
-            },
-            {
-              "type": "stat",
-              "label": "命令调用",
-              "value": {
-                "source": "log",
-                "field": "counts.command"
-              }
-            },
-            {
-              "type": "stat",
-              "label": "后台事件",
-              "value": {
-                "source": "log",
-                "field": "counts.system"
-              }
-            }
-          ]
-        },
-        {
-          "type": "text",
-          "label": "类型筛选",
-          "value": "全部 / llm=LLM决策 / command=命令 / system=后台事件（在下方选择后点刷新）"
-        },
-        {
-          "type": "table",
-          "label": "事件流水",
-          "value": {
-            "source": "log",
-            "field": "entries"
-          },
-          "selection": "ev",
-          "detail": "ev_detail",
-          "columns": [
-            {
-              "field": "time",
-              "label": "时间"
-            },
-            {
-              "field": "kind",
-              "label": "类型"
-            },
-            {
-              "field": "title",
-              "label": "事件"
-            },
-            {
-              "field": "detail",
-              "label": "内容"
             }
           ]
         },

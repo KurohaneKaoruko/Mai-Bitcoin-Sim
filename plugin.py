@@ -387,7 +387,7 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
         if not hasattr(self, "journal"):
             return {"entries": []}
         limit = max(1, min(200, int(limit)))
-        kind = kind if kind in ("llm", "command", "system") else ""
+        kind = "" if kind in ("", "all") else (kind if kind in ("llm", "command", "system") else "")
         entries = await self.journal.tail(limit, kind)
         rows = [{
             "time": fmt_ts(int(e.get("ts", 0))),
