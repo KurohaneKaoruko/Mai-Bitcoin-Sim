@@ -17,7 +17,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 # 插件目录进 sys.path，确保无论以包还是单目录方式加载都能 import core
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -29,10 +29,12 @@ from maibot_sdk.types import ToolParameterInfo, ToolParamType  # noqa: E402
 from typing import List  # noqa: E402
 
 from core.chart import curve_html, kline_html, kline_text, sparkline  # noqa: E402
+from core.journal import Journal  # noqa: E402
 from core.market import MarketAggregator, Ticker24h, normalize_symbol  # noqa: E402
+from core.replay import ReplayEngine, ReplayResult  # noqa: E402
 from core.wallet import DCAPlan, FuturesPosition, PriceAlert, Trade, Wallet, WalletStore, now  # noqa: E402
 
-PLUGIN_VERSION = "0.3.1"
+PLUGIN_VERSION = "0.4.0"
 KLINE_INTERVALS = ("5m", "15m", "1h", "4h", "1d")
 FUNDING_INTERVAL = 8 * 3600  # 资金费结算周期：8 小时（UTC 0/8/16 点对齐）
 
@@ -49,63 +51,74 @@ class PluginSection(PluginConfigBase):
     """插件基础设置（宿主保留节）"""
     __ui_label__ = "插件"
     __ui_order__ = 0
-    enabled: bool = Field(default=True, description="插件总开关")
-    config_version: str = Field(default="0.3.1", description="配置版本号；配置结构变更时递增，宿主据此迁移")
+    enabled: bool = Field(default=True, description="插件总开关", json_schema_extra={"label": "启用插件"})
+    config_version: str = Field(default="0.4.0", description="配置版本号；配置结构变更时递增，宿主据此迁移", json_schema_extra={"label": "配置版本"})
 
 
 class MainConfig(PluginConfigBase):
     """基础配置"""
     __ui_label__ = "基础"
-    enabled: bool = Field(default=True, description="是否启用插件")
-    initial_cash: float = Field(default=100000.0, description="初始资金（USDT）")
-    wallet_mode: str = Field(default="global", description="钱包模式：global=全局单钱包（默认）；chat=每个聊天流一个钱包")
+    enabled: bool = Field(default=True, description="是否启用插件", json_schema_extra={"label": "启用插件"})
+    initial_cash: float = Field(default=100000.0, description="初始资金（USDT）", json_schema_extra={"label": "初始资金 (USDT)"})
+    wallet_mode: Literal["global", "chat"] = Field(
+        default="global",
+        description="钱包模式：global=全局单钱包（默认）；chat=每个聊天流一个钱包",
+        json_schema_extra={"label": "钱包模式"},
+    )
 
 
 class TradingConfig(PluginConfigBase):
     """交易参数"""
     __ui_label__ = "交易参数"
-    spot_fee: float = Field(default=0.001, description="现货手续费率（0.001=0.1%）")
-    futures_fee: float = Field(default=0.0005, description="合约手续费率（0.0005=0.05%）")
-    maintenance_margin_rate: float = Field(default=0.005, description="维持保证金率（爆仓线用）")
-    default_leverage: float = Field(default=3.0, description="合约默认杠杆倍数")
-    max_leverage: float = Field(default=20.0, description="最大允许杠杆")
-    funding_settlement: bool = Field(default=True, description="是否结算永续资金费（每 8 小时）")
-    funding_default: float = Field(default=0.0001, description="资金费率获取失败时的兜底费率（0.0001=0.01%）")
-    allow_ai_short: bool = Field(default=True, description="是否允许麦麦（AI Tool）开空单")
-    allow_ai_long: bool = Field(default=True, description="是否允许麦麦（AI Tool）开多单")
-    allow_ai_trade: bool = Field(default=True, description="是否允许麦麦（AI Tool）自主下单（买入/卖出）")
+    spot_fee: float = Field(default=0.001, description="现货手续费率（0.001=0.1%）", json_schema_extra={"label": "现货手续费率"})
+    futures_fee: float = Field(default=0.0005, description="合约手续费率（0.0005=0.05%）", json_schema_extra={"label": "合约手续费率"})
+    maintenance_margin_rate: float = Field(default=0.005, description="维持保证金率（爆仓线用）", json_schema_extra={"label": "维持保证金率"})
+    default_leverage: float = Field(default=3.0, description="合约默认杠杆倍数", json_schema_extra={"label": "默认杠杆"})
+    max_leverage: float = Field(default=20.0, description="最大允许杠杆", json_schema_extra={"label": "最大杠杆"})
+    funding_settlement: bool = Field(default=True, description="是否结算永续资金费（每 8 小时）", json_schema_extra={"label": "资金费结算"})
+    funding_default: float = Field(default=0.0001, description="资金费率获取失败时的兜底费率（0.0001=0.01%）", json_schema_extra={"label": "兜底资金费率"})
+    allow_ai_short: bool = Field(default=True, description="是否允许麦麦（AI Tool）开空单", json_schema_extra={"label": "允许 AI 开空"})
+    allow_ai_long: bool = Field(default=True, description="是否允许麦麦（AI Tool）开多单", json_schema_extra={"label": "允许 AI 开多"})
+    allow_ai_trade: bool = Field(default=True, description="是否允许麦麦（AI Tool）自主下单（买入/卖出）", json_schema_extra={"label": "允许 AI 自主交易"})
 
 
 class MarketConfig(PluginConfigBase):
     """行情源"""
     __ui_label__ = "行情源"
-    price_cache_ttl: float = Field(default=10.0, description="价格缓存秒数")
-    remeasure_hours: float = Field(default=6.0, description="行情源定期重测速间隔（小时）")
+    price_cache_ttl: float = Field(default=10.0, description="价格缓存秒数", json_schema_extra={"label": "价格缓存 (秒)"})
+    remeasure_hours: float = Field(default=6.0, description="行情源定期重测速间隔（小时）", json_schema_extra={"label": "重测速间隔 (小时)"})
 
 
 class ChartConfig(PluginConfigBase):
     """图表"""
     __ui_label__ = "图表"
-    kline_interval: str = Field(default="1h", description="默认K线周期（5m/15m/1h/4h/1d）")
-    kline_limit: int = Field(default=72, description="默认K线根数（≤300）")
+    kline_interval: Literal["5m", "15m", "1h", "4h", "1d"] = Field(
+        default="1h",
+        description="默认K线周期",
+        json_schema_extra={"label": "默认K线周期"},
+    )
+    kline_limit: int = Field(default=72, description="默认K线根数（≤300）", json_schema_extra={"label": "默认K线根数"})
 
 
 class TaskConfig(PluginConfigBase):
     """后台任务"""
     __ui_label__ = "后台任务"
-    tick_seconds: int = Field(default=60, description="后台巡检间隔秒数（爆仓/止盈止损/警报/定投/快照）")
-    snapshot_minutes: int = Field(default=30, description="资产快照间隔分钟")
-    liquidation_alert: bool = Field(default=True, description="爆仓时是否主动发消息提醒")
-    liquidation_near_pct: float = Field(default=10.0, description="临近爆仓预警阈值（距爆仓价百分比，0=关闭；每仓 30 分钟最多提醒一次）")
-    daily_report: bool = Field(default=True, description="每天定时发送收益报告")
-    report_hour: int = Field(default=20, description="每日报告发送时间（24小时制，按宿主时区）")
+    tick_seconds: int = Field(default=60, description="后台巡检间隔秒数（爆仓/止盈止损/警报/定投/快照）", json_schema_extra={"label": "巡检间隔 (秒)"})
+    snapshot_minutes: int = Field(default=30, description="资产快照间隔分钟", json_schema_extra={"label": "快照间隔 (分钟)"})
+    liquidation_alert: bool = Field(default=True, description="爆仓时是否主动发消息提醒", json_schema_extra={"label": "爆仓提醒"})
+    liquidation_near_pct: float = Field(default=10.0, description="临近爆仓预警阈值（距爆仓价百分比，0=关闭；每仓 30 分钟最多提醒一次）", json_schema_extra={"label": "临近爆仓预警阈值 (%)"})
+    daily_report: bool = Field(default=True, description="每天定时发送收益报告", json_schema_extra={"label": "每日报告"})
+    report_hour: int = Field(default=20, description="每日报告发送时间（24小时制，按宿主时区）", json_schema_extra={"label": "报告时间 (时)"})
     alert_targets: List[str] = Field(
         default_factory=list,
         description=(
             "爆仓/定投等主动通知的目标列表，写群号或QQ号（如 ['123456', '987654']）。"
             "留空 = 只发给钱包最近活跃的聊天流。多个目标会逐个尝试发送。"
         ),
+        json_schema_extra={"label": "主动通知目标", "placeholder": "如：123456, 987654（群号或QQ号）"},
     )
+    journal_max_entries: int = Field(default=500, description="决策日志保留条数（LLM 决策/命令/后台事件环形记录）", json_schema_extra={"label": "决策日志上限 (条)"})
+    replay_max_candles: int = Field(default=2000, description="历史回放单次最多 K 线根数（防误拉超长时段）", json_schema_extra={"label": "回放K线上限 (根)"})
 
 
 class CryptoTraderConfig(PluginConfigBase):
@@ -192,6 +205,7 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
         data_dir = Path(self.ctx.paths.data_dir)
         self.store = WalletStore(data_dir, cfg.main.initial_cash, cfg.main.wallet_mode)
         self.market = MarketAggregator(price_ttl=cfg.market.price_cache_ttl)
+        self.journal = Journal(data_dir, max_entries=cfg.task.journal_max_entries)
         self._tick_task = None
         self._last_report_day = -1
         self._liq_warn_ts: Dict[str, int] = {}   # 临近爆仓预警冷却：key -> 上次提醒时间戳
@@ -229,6 +243,20 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
                 self.store.mode = mode
 
     # ── WebUI 仪表盘数据 ──
+
+    def _log_tool(self, tool_name: str, kwargs: Dict[str, Any], ok: bool, reply: str) -> None:
+        """把一次 Tool 调用记入决策日志（含 LLM 思考 reasoning）。"""
+        if not hasattr(self, "journal"):
+            return
+        reasoning = str(kwargs.get("reasoning") or "").strip()
+        args = {k: v for k, v in kwargs.items()
+                if k not in ("reasoning", "stream_id") and v not in (None, "")}
+        title = f"{tool_name}({' '.join(f'{k}={v}' for k, v in args.items())})"
+        asyncio.create_task(self.journal.log(
+            "llm", title[:200], reasoning=reasoning,
+            detail=reply[:300], stream_id=str(kwargs.get("stream_id") or ""),
+            meta={"ok": ok},
+        ))
 
     @API("get_dashboard", description="投资仪表盘：总览/持仓/合约/成交/资产曲线", version="1")
     async def api_get_dashboard(self) -> Dict[str, Any]:
@@ -353,6 +381,77 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
             "curve": curve,
         }
 
+    @API("get_journal", description="决策日志：LLM 思考/命令/后台事件流水", version="1")
+    async def api_get_journal(self, limit: int = 100, kind: str = "") -> Dict[str, Any]:
+        """决策日志数据源。kind: ''=全部 / llm / command / system。"""
+        if not hasattr(self, "journal"):
+            return {"entries": []}
+        limit = max(1, min(200, int(limit)))
+        kind = kind if kind in ("llm", "command", "system") else ""
+        entries = await self.journal.tail(limit, kind)
+        rows = [{
+            "time": fmt_ts(int(e.get("ts", 0))),
+            "kind": e.get("kind", ""),
+            "title": e.get("title", ""),
+            "reasoning": e.get("reasoning", ""),
+            "detail": e.get("detail", ""),
+            "ok": bool(e.get("meta", {}).get("ok", True)),
+        } for e in entries]
+        counts = {"llm": 0, "command": 0, "system": 0}
+        all_entries = await self.journal.load()
+        for e in all_entries:
+            k = e.get("kind", "")
+            if k in counts:
+                counts[k] += 1
+        return {"total": len(all_entries), "counts": counts, "entries": rows}
+
+    @API("run_replay", description="页面触发历史回放（钱包拨回过去，逐K线重演爆仓/止盈止损/资金费）", version="1")
+    async def api_run_replay(self, preset: str = "week", until: str = "") -> Dict[str, Any]:
+        """WebUI 触发回放。preset: day/week/month/quarter/year；until: 可选 'YYYY-MM-DD'。"""
+        try:
+            rest = []
+            if until:
+                u = self._parse_until(until)
+                if u is None:
+                    return {"success": False, "message": f"日期无效：{until}（格式 YYYY-MM-DD）"}
+                rest = ["until", until, preset]
+            else:
+                rest = [preset]
+            # 回放作用于全局钱包（WebUI 侧无聊天流上下文）
+            text = await self._cmd_replay(WalletStore.GLOBAL_KEY, rest)
+            return {"success": True, "message": text}
+        except UserError as e:
+            return {"success": False, "message": str(e)}
+        except Exception as e:  # noqa: BLE001
+            self.ctx.logger.exception("WebUI 回放失败")
+            return {"success": False, "message": f"{type(e).__name__}: {e}"}
+
+    @API("reset_wallet", description="页面重置全局钱包（清空持仓与记录，恢复初始资金）", version="1")
+    async def api_reset_wallet(self) -> Dict[str, Any]:
+        """WebUI 触发钱包重置（危险操作，页面有确认弹窗）。"""
+        try:
+            text = await self._cmd_reset_confirm(WalletStore.GLOBAL_KEY)
+            return {"success": True, "message": text}
+        except UserError as e:
+            return {"success": False, "message": str(e)}
+        except Exception as e:  # noqa: BLE001
+            self.ctx.logger.exception("WebUI 重置失败")
+            return {"success": False, "message": f"{type(e).__name__}: {e}"}
+
+    @API("get_replay_status", description="回放参数预设与钱包可回放状态", version="1")
+    async def api_replay_status(self) -> Dict[str, Any]:
+        presets = {k: {"interval": v[0], "candles": v[1]} for k, v in self._REPLAY_PRESETS.items()}
+        if not hasattr(self, "store"):
+            return {"ready": False, "presets": presets}
+        w = await self.store.get(WalletStore.GLOBAL_KEY)
+        has_activity = bool(w.trades or w.positions or w.shorts)
+        return {
+            "ready": has_activity,
+            "presets": presets,
+            "max_candles": int(self.config.task.replay_max_candles),
+            "hint": "" if has_activity else "钱包还是空的：先在聊天里交易一两笔，或等 AI 自主下单后再回放",
+        }
+
     # ── 后台任务：爆仓检查 + 定投 + 快照 + 定期重测速 ──
 
     async def _background_loop(self) -> None:
@@ -388,6 +487,7 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
                         for ev in events:
                             self.ctx.logger.info("钱包 %s 资金费: %s", w.key, ev)
                             await self._notify(w, ev)
+                            await self.journal.log("system", f"资金费结算（{w.key}）", detail=ev)
                         w.funding_next = next_funding_ts(now())
                         changed = True
 
@@ -397,6 +497,7 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
                         changed = True
                         self.ctx.logger.info("钱包 %s 触发 %s", w.key, ev)
                         await self._notify(w, ev)
+                        await self.journal.log("system", f"止盈止损（{w.key}）", detail=ev)
 
                     # 3. 爆仓检查 + 通知 + 临近预警
                     if self.config.task.liquidation_alert:
@@ -406,12 +507,14 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
                             side_name = "空单" if sp.side == "short" else "多单"
                             direct = "涨到" if sp.side == "short" else "跌到"
                             self.ctx.logger.warning("钱包 %s 爆仓: %s %.6g张 @%.6g", w.key, sp.symbol, sp.qty, mark)
-                            await self._notify(w, (
+                            liq_text = (
                                 f"⚠️ 爆仓警报 {sp.symbol}\n"
                                 f"{sp.leverage:g}x {side_name}在 {fmt_price(mark)} 触发爆仓线 {fmt_price(sp.liquidation_price)}"
                                 f"（价格{direct}爆仓价）\n"
                                 f"损失全部保证金 {sp.margin:,.2f} U 💀"
-                            ))
+                            )
+                            await self._notify(w, liq_text)
+                            await self.journal.log("system", f"💥 爆仓 {sp.symbol} {side_name}（{w.key}）", detail=liq_text)
                         # 临近预警：距爆仓 < 阈值且未爆，每仓冷却 30 分钟
                         near_pct = self.config.task.liquidation_near_pct
                         if near_pct > 0:
@@ -440,10 +543,12 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
                             del w.alerts[aid]
                             changed = True
                             arrow = "📈" if a.op == ">=" else "📉"
-                            await self._notify_stream(a.stream_id, w, (
+                            alert_text = (
                                 f"🔔 价格警报 {a.symbol}\n"
                                 f"{arrow} 已{'上穿' if a.op == '>=' else '下破'} {fmt_price(a.price)}（现价 {fmt_price(mark)}）"
-                            ))
+                            )
+                            await self._notify_stream(a.stream_id, w, alert_text)
+                            await self.journal.log("system", f"🔔 价格警报触发 {a.symbol}", detail=alert_text)
 
                     # 5. 定投到期执行
                     for plan in w.due_plans():
@@ -455,10 +560,13 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
                         try:
                             w.buy(plan.symbol, plan.amount_usdt, price, self.config.trading.spot_fee, note=f"dca:{plan.id}")
                             w.advance_plan(plan, f"✓ {fmt_ts(now())} 买 {fmt_usdt(plan.amount_usdt)} U")
+                            await self.journal.log("system", f"定投买入 {plan.symbol}（计划 {plan.id}）", detail=f"{fmt_usdt(plan.amount_usdt)} U @ {fmt_price(price)}")
                         except ValueError as e:
                             w.advance_plan(plan, f"现金不足: {e}")
+                            await self.journal.log("system", f"定投失败 {plan.symbol}（计划 {plan.id}）", detail=f"现金不足: {e}")
                         except Exception as e:  # noqa: BLE001
                             w.advance_plan(plan, f"异常: {e}")
+                            await self.journal.log("system", f"定投异常 {plan.symbol}（计划 {plan.id}）", detail=str(e))
 
                     # 6. 资产快照
                     snap_gap = max(60, self.config.task.snapshot_minutes * 60)
@@ -702,6 +810,11 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
             self.ctx.logger.exception("命令处理异常")
             text = f"💀 出了点问题：{type(e).__name__}: {e}"
             ok = False
+        if hasattr(self, "journal"):
+            sub = args.split()[0] if args else "总览"
+            asyncio.create_task(self.journal.log(
+                "command", f"/coin {sub}".strip(), detail=text[:300], stream_id=stream_id,
+            ))
         return ok, text, 2
 
     async def _dispatch(self, stream_id: str, args: str) -> str:
@@ -754,6 +867,8 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
             return await self._cmd_market(stream_id)
         if sub in ("funding", "资金费", "费率"):
             return await self._cmd_funding(stream_id, rest)
+        if sub in ("replay", "回放", "历史模拟"):
+            return await self._cmd_replay(stream_id, rest)
         raise UserError(f"不认识的子命令「{parts[0]}」，/coin help 看用法")
 
     # ── 子命令实现 ──
@@ -765,6 +880,8 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
             "/coin                     资产总览",
             "/coin price BTC [ETH...]  实时价格 + 24h涨跌（支持中文币名）",
             "/coin funding [BTC]       当前资金费率（缺省=持仓币种）",
+            "/coin replay [week]        历史回放：拨回过去重演行情（day/week/month/quarter/year）",
+            "/coin replay until 2025-01-01 week   从指定日期回放一周",
             "/coin buy BTC 100u        买入100U的BTC（或 /coin buy BTC 0.01 按数量）",
             "/coin sell BTC all        卖出（all=清仓，也可写数量）",
             "/coin short BTC 0.01 5x   开空单（默认杠杆见配置，0.01张×5倍）",
@@ -831,6 +948,121 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
                 continue
             direction = "多头付 → 空头收" if rate >= 0 else "空头付 → 多头收"
             lines.append(f"{sym}  资金费率 {rate * 100:+.4f}%（{direction}）")
+        return "\n".join(lines)
+
+    # ── 历史回放 ──
+
+    _REPLAY_PRESETS = {
+        "day":   ("1h", 24),     # 最近1天
+        "week":  ("1h", 168),    # 最近一周
+        "month": ("4h", 180),    # 最近一月（4h×180）
+        "quarter": ("4h", 540),  # 最近一季
+        "year":  ("1d", 365),    # 最近一年
+    }
+
+    @staticmethod
+    def _parse_until(spec: str) -> Optional[int]:
+        """把 '2025-01-01' / '2025-01-01T08:00' / '2025-01-01 08:00' 解析为秒级时间戳。"""
+        import datetime
+        spec = spec.strip().replace("T", " ")
+        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                return int(datetime.datetime.strptime(spec, fmt).timestamp())
+            except ValueError:
+                continue
+        return None
+
+    async def _cmd_replay(self, stream_id: str, rest: List[str]) -> str:
+        """历史回放：/coin replay <预设|.until 日期> [快照密度]
+
+        例：
+          /coin replay week              回放最近一周（1h K线）
+          /coin replay month             回放最近一月
+          /coin replay until 2025-01-01 week   从该时点回放一周
+        回放会把钱包送回过去时点，逐根K线跑爆仓/止盈止损/资金费，结束后回到实时盘。
+        """
+        cfg = self.config
+        w = await self.store.get(stream_id)
+        if not w.trades and not w.positions and not w.shorts:
+            raise UserError("钱包还是空的，先交易一两笔再回放（回放作用于已有持仓/仓位）")
+
+        until_ts: Optional[int] = None
+        preset = ""
+        args = list(rest)
+        if args and args[0] == "until":
+            if len(args) < 3:
+                raise UserError("用法：/coin replay until <日期> <预设>  例：/coin replay until 2025-01-01 week")
+            until_ts = self._parse_until(args[1])
+            if until_ts is None:
+                raise UserError(f"日期无效：{args[1]}（格式 2025-01-01 或 2025-01-01 08:00）")
+            args = args[2:]
+        if not args:
+            raise UserError(
+                "用法：/coin replay <day|week|month|quarter|year> [until 日期]\n"
+                "例：/coin replay week　　/coin replay until 2025-01-01 month"
+            )
+        preset = args[0].lower()
+        if preset not in self._REPLAY_PRESETS:
+            raise UserError(f"未知预设：{preset}（可选 {'/'.join(self._REPLAY_PRESETS)}）")
+        interval, count = self._REPLAY_PRESETS[preset]
+        count = min(count, cfg.task.replay_max_candles)
+
+        # 拉历史K线：endTime = until（缺省=现在）
+        import time as _time
+        end_ms = (until_ts if until_ts else int(_time.time())) * 1000
+        # 多拉一根，回放从「该时点的前一根收盘」开始（起点价格=首根 open）
+        sym_hint = sorted(set(w.positions) | {sp.symbol for sp in w.shorts.values()})
+        replay_syms = sym_hint[:1] if sym_hint else ["BTC"]
+        # 回放主币种 = 最大敞口币种；现货持仓里有多个币种时提示仅按主币种回放
+        try:
+            candles = await self.market.get_klines_history(replay_syms[0], interval, end_ms, limit=count + 1)
+        except Exception as e:  # noqa: BLE001
+            raise UserError(f"历史K线拉取失败：{e}") from e
+        if len(candles) < 2:
+            raise UserError("该时段历史K线不足")
+        symbol = replay_syms[0]
+        start_dt = candles[0].ts
+        end_dt = candles[-1].ts
+
+        # 资金费率结算偏好
+        funding_default = cfg.trading.funding_default
+        engine = ReplayEngine(
+            w, fee_rate=cfg.trading.futures_fee, funding_default=funding_default,
+            mmr=cfg.trading.maintenance_margin_rate,
+        )
+
+        async def on_event(text: str) -> None:
+            if hasattr(self, "journal"):
+                await self.journal.log("system", "历史回放事件", detail=text[:500])
+
+        res: ReplayResult = await engine.run(candles, symbol, interval, on_event=on_event)
+
+        # 回放产生的快照与成交保留（历史时间戳）；保存钱包
+        await self.store.save(w)
+        await self.journal.log(
+            "system",
+            f"历史回放 {symbol} {preset}（{fmt_ts(start_dt)} → {fmt_ts(end_dt)}）",
+            detail=(
+                f"K线 {res.candles} 根；爆仓 {res.liquidations}、止盈止损 {res.tp_sl_hits}、"
+                f"资金费 {res.fundings} 次；资产 {res.value_before:,.0f} → {res.value_after:,.0f} U"
+            ),
+        )
+
+        import datetime
+        s_dt = datetime.datetime.fromtimestamp(start_dt).strftime("%m-%d")
+        e_dt = datetime.datetime.fromtimestamp(end_dt).strftime("%m-%d")
+        chg = (res.end_price / res.start_price - 1) * 100
+        lines = [
+            f"🎬 历史回放完成 {symbol}（{s_dt} → {e_dt}，{interval}×{res.candles}）",
+            f"行情：{fmt_price(res.start_price)} → {fmt_price(res.end_price)}（{fmt_pct(chg)}）",
+            f"事件：💥爆仓 {res.liquidations}　🎯止盈止损 {res.tp_sl_hits}　💸资金费 {res.fundings}",
+            f"资产：{res.value_before:,.2f} → {res.value_after:,.2f} U（{fmt_pct(res.pnl_pct)}）",
+            "⏰ 已回到实时盘，用 /coin 看当前持仓",
+        ]
+        for n in res.notes[-5:]:
+            lines.append(f"· {n}")
+        if len(res.notes) > 5:
+            lines.append(f"…（共 {len(res.notes)} 条事件，WebUI 决策日志可查全部）")
         return "\n".join(lines)
 
     async def _cmd_buy(self, stream_id: str, rest: List[str]) -> str:
@@ -1232,9 +1464,11 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
         try:
             sym = normalize_symbol(symbol)
             t = await self.market.get_ticker24h(sym)
-            return True, f"{sym} 现价 {fmt_price(t.price)} USDT，24h {fmt_pct(t.change_pct)}（高 {fmt_price(t.high)} 低 {fmt_price(t.low)}，源 {t.source}）", 1
+            __r = (True, f"{sym} 现价 {fmt_price(t.price)} USDT，24h {fmt_pct(t.change_pct)}（高 {fmt_price(t.high)} 低 {fmt_price(t.low)}，源 {t.source}）", 1)
         except Exception as e:  # noqa: BLE001
-            return False, f"查价失败：{e}", 1
+            __r = (False, f"查价失败：{e}", 1)
+        self._log_tool("crypto_get_price", kwargs, __r[0], str(__r[1]))
+        return __r
 
     @Tool(
         name="crypto_get_portfolio",
@@ -1247,9 +1481,11 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
         try:
             w = await self.store.get(stream_id)
             lines, _ = await self._portfolio_lines(w)
-            return True, "\n".join(lines), 1
+            __r = (True, "\n".join(lines), 1)
         except Exception as e:  # noqa: BLE001
-            return False, f"查询持仓失败：{e}", 1
+            __r = (False, f"查询持仓失败：{e}", 1)
+        self._log_tool("crypto_get_portfolio", kwargs, __r[0], str(__r[1]))
+        return __r
 
     @Tool(
         name="crypto_trade",
@@ -1273,27 +1509,34 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
             args = [symbol, amount] + ([leverage + "x"] if leverage and action in ("short", "long") else [])
             if action in ("buy", "买", "买入"):
                 if not cfg.allow_ai_trade:
-                    return False, "配置未允许麦麦自主下单", 1
-                return True, await self._cmd_buy(stream_id, args), 3
-            if action in ("sell", "卖", "卖出"):
+                    __r = (False, "配置未允许麦麦自主下单", 1)
+                else:
+                    __r = (True, await self._cmd_buy(stream_id, args), 3)
+            elif action in ("sell", "卖", "卖出"):
                 if not cfg.allow_ai_trade:
-                    return False, "配置未允许麦麦自主下单", 1
-                return True, await self._cmd_sell(stream_id, args), 3
-            if action in ("short", "开空", "做空"):
+                    __r = (False, "配置未允许麦麦自主下单", 1)
+                else:
+                    __r = (True, await self._cmd_sell(stream_id, args), 3)
+            elif action in ("short", "开空", "做空"):
                 if not cfg.allow_ai_short:
-                    return False, "配置未允许麦麦开空单", 1
-                return True, await self._cmd_short(stream_id, args), 3
-            if action in ("long", "开多", "做多"):
+                    __r = (False, "配置未允许麦麦开空单", 1)
+                else:
+                    __r = (True, await self._cmd_short(stream_id, args), 3)
+            elif action in ("long", "开多", "做多"):
                 if not cfg.allow_ai_long:
-                    return False, "配置未允许麦麦开多单", 1
-                return True, await self._cmd_long(stream_id, args), 3
-            if action in ("close", "平空", "平仓", "平多"):
-                return True, await self._cmd_close(stream_id, [symbol] + amount.split()), 3
-            return False, f"未知 action：{action}（buy/sell/long/short/close）", 1
+                    __r = (False, "配置未允许麦麦开多单", 1)
+                else:
+                    __r = (True, await self._cmd_long(stream_id, args), 3)
+            elif action in ("close", "平空", "平仓", "平多"):
+                __r = (True, await self._cmd_close(stream_id, [symbol] + amount.split()), 3)
+            else:
+                __r = (False, f"未知 action：{action}（buy/sell/long/short/close）", 1)
         except ValueError as e:
-            return False, str(e), 1
+            __r = (False, str(e), 1)
         except Exception as e:  # noqa: BLE001
-            return False, f"下单失败：{type(e).__name__}: {e}", 1
+            __r = (False, f"下单失败：{type(e).__name__}: {e}", 1)
+        self._log_tool("crypto_trade", kwargs, __r[0], str(__r[1]))
+        return __r
 
     @Tool(
         name="crypto_set_alert",
@@ -1310,11 +1553,14 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
             op_map = {">=": ">=", ">": ">=", "上穿": ">=", "突破": ">=", "<=": "<=", "<": "<=", "下破": "<=", "跌破": "<="}
             cmp_op = op_map.get(op.strip())
             if not cmp_op:
-                return False, f"op 要写 >= 或 <=（也认：上穿/突破/下破/跌破）", 1
-            args = ["add", symbol, cmp_op, price]
-            return True, await self._cmd_price_alert(stream_id, args), 2
+                __r = (False, "op 要写 >= 或 <=（也认：上穿/突破/下破/跌破）", 1)
+            else:
+                args = ["add", symbol, cmp_op, price]
+                __r = (True, await self._cmd_price_alert(stream_id, args), 2)
         except Exception as e:  # noqa: BLE001
-            return False, f"设置警报失败：{e}", 1
+            __r = (False, f"设置警报失败：{e}", 1)
+        self._log_tool("crypto_set_alert", kwargs, __r[0], str(__r[1]))
+        return __r
 
     @Tool(
         name="crypto_market_overview",
@@ -1328,9 +1574,11 @@ class MaiBitcoinSimPlugin(MaiBotPlugin):
             for sym, t in pairs:
                 arrow = "🔴" if t.change_pct >= 0 else "🟢"
                 parts.append(f"{sym} {fmt_price(t.price)}（{arrow}{fmt_pct(t.change_pct)}）")
-            return True, "大盘24h：" + "　".join(parts), 1
+            __r = (True, "大盘24h：" + "　".join(parts), 1)
         except Exception as e:  # noqa: BLE001
-            return False, f"获取大盘行情失败：{e}", 1
+            __r = (False, f"获取大盘行情失败：{e}", 1)
+        self._log_tool("crypto_market_overview", kwargs, __r[0], str(__r[1]))
+        return __r
 
 
 class UserError(Exception):

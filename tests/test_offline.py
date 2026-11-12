@@ -315,6 +315,45 @@ check("曲线HTML", "<svg" in ch and "linearGradient" in ch)
 check("空快照曲线容错", "快照不足" in curve_html([]))
 check("sparkline", len(sparkline([1, 2, 3, 4])) == 4)
 
+# ─── 回放引擎 ───
+print("[回放引擎]")
+from core.replay import ReplayEngine, _candle_extremes, MAX_CANDLES
+
+seq = _candle_extremes(Candle(0, 100, 110, 90, 105, 1))
+check("K线暴露顺序含首尾", seq[0] == 100 and seq[-1] == 105 and 90 in seq and 110 in seq)
+check("暴露顺序扫到两影线", abs(seq.index(90) - seq.index(110)) >= 1)
+
+async def _replay_tests():
+    # 空单在回放中爆仓
+    w = Wallet("t", 10000.0)
+    w.open_short("BTC", 0.5, 10.0, 100.0, 0.0005, 0.005)
+    eng = ReplayEngine(w, 0.0005, 0.0001)
+    candles = [Candle(1000, 100, 105, 99, 104, 1), Candle(4600, 104, 111, 103, 110, 1), Candle(8200, 110, 112, 108, 109, 1)]
+    res = await eng.run(candles, "BTC", "1h")
+    check("回放触发爆仓", res.liquidations == 1 and not w.shorts)
+    check("回放摘要字段", res.candles == 3 and res.start_price == 100 and res.end_price == 109)
+    check("回放曲线非空", len(res.curve) >= 2 and approx(res.curve[-1][1], res.value_after, 1e-6))
+
+    # 多单止盈在回放中触发
+    w2 = Wallet("t2", 10000.0)
+    w2.buy("BTC", 5000, 100.0, 0.001)
+    w2.set_tp_sl("BTC", tp=108.0)
+    eng2 = ReplayEngine(w2, 0.001, 0.0001)
+    candles2 = [Candle(1000, 100, 103, 99, 102, 1), Candle(4600, 102, 109, 101, 108.5, 1), Candle(8200, 108, 111, 107, 110, 1)]
+    res2 = await eng2.run(candles2, "BTC", "1h")
+    check("回放触发止盈", res2.tp_sl_hits == 1 and "BTC" not in w2.positions, str(res2.notes))
+
+    # 资金费按周期结算
+    w3 = Wallet("t3", 10000.0)
+    w3.open_long("BTC", 0.3, 5.0, 100.0, 0.0005, 0.005)
+    eng3 = ReplayEngine(w3, 0.0005, 0.0001)
+    long_candles = [Candle(1000 + i * 3600, 100, 101, 99, 100, 1) for i in range(30)]
+    res3 = await eng3.run(long_candles, "BTC", "1h")
+    check("回放结算资金费", res3.fundings >= 1 and w3.funding_total > 0, f"{res3.fundings} 次")
+    check("回放多单存活", "BTC|L" in w3.shorts)
+
+asyncio.run(_replay_tests())
+
 # ─── 行情（真实网络，可选） ───
 print("[行情源·实网]")
 if "--no-net" not in sys.argv:

@@ -375,6 +375,69 @@ async def main():
     declared = {i["name"] for i in api_comps}
     check("webui.json 绑定的 API 均已注册", bound <= declared, f"{bound} vs {declared}")
 
+    print("[决策日志]")
+    check("journal 初始化", hasattr(p, "journal") and p.journal is not None)
+    # Tool 调用带 reasoning → 应记入 llm 日志
+    ok, msg, _ = await p.tool_get_price(symbol="BTC", stream_id="s1", reasoning="用户问BTC价格，我来查一下")
+    check("tool 查价（带 reasoning）", ok, msg)
+    await asyncio.sleep(0.3)
+    j = await p.api_get_journal(limit=50, kind="llm")
+    llm_entries = j["entries"]
+    check("LLM 决策已记录", len(llm_entries) > 0 and "crypto_get_price" in llm_entries[0]["title"], str(llm_entries[:1]))
+    check("reasoning 已捕获", any("用户问BTC" in (e.get("reasoning") or "") for e in llm_entries), str(llm_entries[0]))
+    # 命令 → command 日志
+    ok, msg, _ = await run_cmd("price BTC")
+    check("price 命令", ok, msg)
+    await asyncio.sleep(0.3)
+    j2 = await p.api_get_journal(limit=50, kind="command")
+    check("命令已记录", any("/coin price" in e["title"] for e in j2["entries"]), str(j2["entries"][:1]))
+    # 全量与统计
+    j3 = await p.api_get_journal(limit=200, kind="")
+    check("全量日志与计数", j3["total"] >= 2 and j3["counts"]["llm"] >= 1 and j3["counts"]["command"] >= 1, str(j3["counts"]))
+    # 日志持久化（journal.jsonl 落盘）
+    await asyncio.sleep(0.3)
+    jp = ROOT / "tests" / ".tmp_data" / "journal.jsonl"
+    check("日志文件落盘", jp.exists(), str(jp))
+    # kind 过滤参数容错
+    j4 = await p.api_get_journal(limit=50, kind="bogus")
+    check("非法 kind 当作全部", "entries" in j4)
+
+    print("[历史回放]")
+    rs = await p.api_replay_status()
+    check("回放状态结构", "presets" in rs and "week" in rs["presets"], str(rs))
+    # 先交易一笔 → 可回放，跑最近1天（1h×24，真实历史K线）
+    ok, msg, _ = await run_cmd("buy BTC 100u")
+    check("回放前买入", ok, msg)
+    rs2 = await p.api_replay_status()
+    check("交易后可回放", rs2["ready"])
+    # 非法参数
+    r1 = await p.api_run_replay(preset="bogus")
+    check("非法预设拒绝", not r1["success"])
+    r2 = await p.api_run_replay(preset="day", until="not-a-date")
+    check("非法日期拒绝", not r2["success"] and "日期" in r2["message"], r2["message"])
+    r3 = await p.api_run_replay(preset="day")
+    check("页面回放成功", r3["success"], r3["message"])
+    if r3["success"]:
+        check("回放结果含摘要", "历史回放完成" in r3["message"] and "资产" in r3["message"], r3["message"][:80])
+    # until 定点回放（远期数据稳定：2025-01-01）
+    r4 = await p.api_run_replay(preset="day", until="2025-01-01")
+    check("until 定点回放", r4["success"], r4["message"])
+    # 命令入口同样可用（先用非法参数验证帮助文案）
+    ok, msg, _ = await run_cmd("replay")
+    check("replay 无参提示用法", not ok and "用法" in msg, msg)
+    ok, msg, _ = await run_cmd("replay week")
+    check("replay 命令成功", ok, msg)
+    # 回放后钱包仍在且资产恒等
+    ov2 = (await p.api_get_dashboard())["overview"]
+    check("回放后总资产恒等式", approx(ov2["total"], ov2["cash"] + ov2["spot_value"] + ov2["margin"] + ov2["fut_upnl"], 0.02), str(ov2))
+    # 回放事件入 system 日志
+    await asyncio.sleep(0.3)
+    j5 = await p.api_get_journal(limit=100, kind="system")
+    check("回写入 system 日志", any("历史回放" in e["title"] for e in j5["entries"]), str(j5["entries"][:1]))
+    # 重置 API（清场，恢复初始资金）
+    rr = await p.api_reset_wallet()
+    check("页面重置钱包", rr["success"] and "重置" in rr["message"], str(rr))
+
     print("[生命周期收尾]")
     await p.on_unload()
     check("on_unload 保存", (ROOT / "tests" / ".tmp_data" / "wallet___global__.json").exists())

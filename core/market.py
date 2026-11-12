@@ -32,6 +32,11 @@ _INTERVAL_MAP = {
     "1d":  {"binance": "1d",  "okx": "1D",  "gate": 86400,   "coinbase": 86400},
 }
 
+# 各 interval 的秒数（回放引擎用）
+INTERVAL_SECONDS = {
+    "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400,
+}
+
 
 def _http_get_json(url: str, timeout: float = HTTP_TIMEOUT) -> Any:
     """同步 GET，返回解析后的 JSON。供 asyncio.to_thread 调用。"""
@@ -116,11 +121,12 @@ class BinanceSource(ExchangeSource):
             source=self.name,
         )
 
-    async def get_klines(self, base: str, interval: str, limit: int) -> List[Candle]:
+    async def get_klines(self, base: str, interval: str, limit: int, end_ms: Optional[int] = None) -> List[Candle]:
         iv = _INTERVAL_MAP[interval]["binance"]
-        rows = await fetch_json(
-            f"{self._base}/api/v3/klines?symbol={self.symbol(base)}&interval={iv}&limit={limit}"
-        )
+        url = f"{self._base}/api/v3/klines?symbol={self.symbol(base)}&interval={iv}&limit={limit}"
+        if end_ms:
+            url += f"&endTime={int(end_ms)}"
+        rows = await fetch_json(url)
         return [Candle(int(r[0] / 1000), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])) for r in rows]
 
 
@@ -164,11 +170,12 @@ class OkxSource(ExchangeSource):
             source=self.name,
         )
 
-    async def get_klines(self, base: str, interval: str, limit: int) -> List[Candle]:
+    async def get_klines(self, base: str, interval: str, limit: int, end_ms: Optional[int] = None) -> List[Candle]:
         bar = _INTERVAL_MAP[interval]["okx"]
-        data = await fetch_json(
-            f"{self._base}/api/v5/market/candles?instId={self.symbol(base)}&bar={bar}&limit={min(limit, 300)}"
-        )
+        url = f"{self._base}/api/v5/market/candles?instId={self.symbol(base)}&bar={bar}&limit={min(limit, 300)}"
+        if end_ms:
+            url += f"&after={int(end_ms)}"  # OKX after=返回早于该时间的数据
+        data = await fetch_json(url)
         rows = data.get("data") or []
         out = []
         for r in rows:  # OKX 倒序：新→旧
@@ -212,11 +219,12 @@ class GateSource(ExchangeSource):
             source=self.name,
         )
 
-    async def get_klines(self, base: str, interval: str, limit: int) -> List[Candle]:
+    async def get_klines(self, base: str, interval: str, limit: int, end_ms: Optional[int] = None) -> List[Candle]:
         sec = _INTERVAL_MAP[interval]["gate"]
-        rows = await fetch_json(
-            f"{self._base}/api/v4/spot/candlesticks?currency_pair={self.symbol(base)}&interval={sec}&limit={min(limit, 1000)}"
-        )
+        url = f"{self._base}/api/v4/spot/candlesticks?currency_pair={self.symbol(base)}&interval={sec}&limit={min(limit, 1000)}"
+        if end_ms:
+            url += f"&to={int(end_ms)}&to_ts=1"  # to=毫秒时间戳
+        rows = await fetch_json(url)
         out = []
         for r in rows:  # gate 倒序
             out.append(Candle(int(r["t"]), float(r["o"]), float(r["h"]), float(r["l"]), float(r["c"]), float(r["v"])))
@@ -430,6 +438,41 @@ class MarketAggregator:
                     raise RuntimeError("空K线")
                 self._cache_put(key, candles, self.kline_ttl)
                 return candles
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{src.name}: {e}")
+                continue
+        raise RuntimeError("；".join(errors) or "无可用行情源")
+
+    async def get_klines_history(self, base: str, interval: str, end_ms: int, limit: int = 500) -> List[Candle]:
+        """取 end_ms 之前的历史K线（含 end_ms 所在根），分页聚合，回放引擎用。
+
+        逐源尝试（各源参数格式不同，基类签名已带 end_ms），Binance 上限 1000 根/次。
+        """
+        base = base.upper().strip()
+        if interval not in _INTERVAL_MAP:
+            raise RuntimeError(f"不支持的 K 线周期: {interval}")
+        errors: List[str] = []
+        for src in self._pick():
+            collected: List[Candle] = []
+            cursor = int(end_ms)
+            remaining = limit
+            try:
+                while remaining > 0:
+                    batch = min(remaining, 1000 if src.name == "Binance" else 300)
+                    candles = await src.get_klines(base, interval, batch, end_ms=cursor)
+                    if not candles:
+                        break
+                    collected = candles + collected
+                    remaining -= len(candles)
+                    first = candles[0].ts * 1000
+                    if first >= cursor:  # 没有更早的数据了
+                        break
+                    cursor = first - 1
+                if collected:
+                    # 去重排序（按 ts）
+                    seen = {c.ts for c in collected}
+                    collected = sorted(collected, key=lambda c: c.ts)
+                    return collected[:limit]
             except Exception as e:  # noqa: BLE001
                 errors.append(f"{src.name}: {e}")
                 continue

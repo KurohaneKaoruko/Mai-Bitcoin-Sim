@@ -16,7 +16,9 @@
 - 🗓 **每日报告**：定时汇报当日盈亏与持仓（时间可配）
 - 🏆 **排行榜**：chat 模式下各钱包总资产排名
 - 🤖 **AI 自主交易**：5 个 Tool 让麦麦在聊天中自己查行情、下单、设警报、汇报持仓——「麦麦全仓梭哈ETH」
-- 🖥 **WebUI 仪表盘**：MaiBot WebUI 侧栏「炒币模拟器」页面，实时查看总览/持仓/合约/成交/资产曲线（30s 自动刷新）
+- 🖥 **WebUI 仪表盘**：MaiBot WebUI 侧栏「炒币模拟器」页面，实时查看总览/持仓/合约/成交/资产曲线（30s 自动刷新），页面可直接触发**历史回放**与**钱包重置**
+- 🧠 **决策日志**：完整记录每次 LLM 交易决策的思考过程（reasoning）、用户命令与后台事件（爆仓/止盈止损/资金费/警报），WebUI「决策概览」页可查
+- ⏪ **历史回放**：把模拟盘拨回过去某个时点，按真实历史K线逐根重演爆仓/止盈止损/资金费，结束后自动回到实时盘——新开功能快速看结果，或让麦麦重历某段行情
 - 👛 **钱包模式**：`global` 全局单钱包（默认）或 `chat` 每聊天流独立
 
 ## 安装
@@ -39,6 +41,8 @@ git clone https://github.com/KurohaneKaoruko/Mai-Bitcoin-Sim.git plugins/mai-bit
 | `/coin help` | 帮助 |
 | `/coin price BTC [ETH...]` | 实时价格 + 24h 涨跌（多币可一起查；支持中文币名：`/coin price 比特币`） |
 | `/coin funding [BTC]` | 当前资金费率（缺省 = 持仓币种） |
+| `/coin replay [week]` | 历史回放：拨回过去重演行情（预设 `day/week/month/quarter/year`） |
+| `/coin replay until 2025-01-01 week` | 从指定日期回放一周（让麦麦经历那段时间的市场） |
 | `/coin buy BTC 100u` | 买入 100 U 的 BTC（`/coin buy BTC 0.01` 按数量） |
 | `/coin sell BTC all` | 卖出（`all` 清仓，或写数量） |
 | `/coin short ETH 100u 5x` | 合约开空：名义 100U × 5 倍杠杆 |
@@ -84,6 +88,8 @@ git clone https://github.com/KurohaneKaoruko/Mai-Bitcoin-Sim.git plugins/mai-bit
 | `task.daily_report` | `true` | 每日收益报告 |
 | `task.report_hour` | `20` | 每日报告发送时间（24h 制） |
 | `task.alert_targets` | `[]` | 主动通知（爆仓/定投异常）发送目标：群号或QQ号列表；留空则发给钱包最近活跃的聊天流 |
+| `task.journal_max_entries` | `500` | 决策日志环形保留条数 |
+| `task.replay_max_candles` | `2000` | 历史回放单次最大 K 线根数 |
 
 ## 数据与规则
 
@@ -108,9 +114,12 @@ mai-bitcoin-sim/
 ├── _manifest.json      # 插件清单
 ├── plugin.py           # 入口：命令路由 + Tool + 生命周期 + 后台任务
 ├── core/
-│   ├── market.py       # 四交易所行情聚合：测速/降级/缓存/K线
+│   ├── market.py       # 四交易所行情聚合：测速/降级/缓存/K线/历史K线
 │   ├── wallet.py       # 钱包引擎：现货/空单/爆仓/定投/持久化
+│   ├── replay.py       # 历史回放引擎：逐K线重演爆仓/止盈止损/资金费
+│   ├── journal.py      # 决策日志：LLM 思考/命令/后台事件 JSONL 环形记录
 │   └── chart.py        # K线 & 资产曲线 SVG（红涨绿跌）
+├── webui.json          # WebUI 页面声明（仪表盘 + 决策日志）
 └── tests/              # 离线 + SDK 集成测试
 ```
 
